@@ -18,8 +18,12 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
-from db import init_db, get_session
-from models import Report, Template
+try:
+    from db import init_db, get_session
+    from models import Report, Template
+except ModuleNotFoundError:
+    from .db import init_db, get_session
+    from .models import Report, Template
 
 
 DEFAULT_TEMPLATE = """# Relatorio para {{ client }}
@@ -423,13 +427,19 @@ a.btn:focus-visible {
   background: #fff;
   border: 1px solid var(--line);
   font-family: "Source Serif 4", "Georgia", serif;
+  line-height: 1.6;
+  word-break: break-word;
 }
 
 .markdown-preview h1,
 .markdown-preview h2,
-.markdown-preview h3 {
+.markdown-preview h3,
+.markdown-preview h4,
+.markdown-preview h5,
+.markdown-preview h6 {
   font-family: "Space Grotesk", "Avenir Next", sans-serif;
   margin-top: 18px;
+  margin-bottom: 8px;
 }
 
 .markdown-preview h1 {
@@ -440,8 +450,76 @@ a.btn:focus-visible {
   font-size: 1.3rem;
 }
 
+.markdown-preview h4 {
+  font-size: 1.1rem;
+}
+
+.markdown-preview h5 {
+  font-size: 1rem;
+}
+
+.markdown-preview h6 {
+  font-size: 0.95rem;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+
 .markdown-preview p {
   margin: 0 0 12px 0;
+}
+
+.markdown-preview p:last-child {
+  margin-bottom: 0;
+}
+
+.markdown-preview strong {
+  font-weight: 700;
+}
+
+.markdown-preview em {
+  font-style: italic;
+}
+
+.markdown-preview mark {
+  background: rgba(217, 119, 6, 0.2);
+  padding: 0 4px;
+  border-radius: 4px;
+}
+
+.markdown-preview sup,
+.markdown-preview sub {
+  font-size: 0.75em;
+}
+
+.markdown-preview abbr[title] {
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: help;
+}
+
+.markdown-preview ul,
+.markdown-preview ol {
+  margin: 0 0 12px 20px;
+  padding-left: 18px;
+}
+
+.markdown-preview li {
+  margin: 0 0 6px 0;
+}
+
+.markdown-preview li > p {
+  margin: 0;
+}
+
+.markdown-preview a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  font-weight: 600;
+}
+
+.markdown-preview a:hover {
+  color: var(--accent-3);
 }
 
 .markdown-preview pre {
@@ -450,6 +528,7 @@ a.btn:focus-visible {
   padding: 12px;
   border-radius: 10px;
   overflow: auto;
+  tab-size: 2;
 }
 
 .markdown-preview code {
@@ -457,6 +536,7 @@ a.btn:focus-visible {
   background: #f6f2ea;
   padding: 2px 4px;
   border-radius: 4px;
+  word-break: break-word;
 }
 
 .markdown-preview pre code {
@@ -469,12 +549,51 @@ a.btn:focus-visible {
   padding-left: 12px;
   color: var(--muted);
   margin: 12px 0;
+  background: rgba(15, 118, 110, 0.05);
+  border-radius: 8px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
+.markdown-preview hr {
+  border: 0;
+  height: 1px;
+  background: var(--line);
+  margin: 18px 0;
+}
+
+.markdown-preview img {
+  max-width: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.12);
+  margin: 8px 0;
+}
+
+.markdown-preview figure {
+  margin: 0 0 12px 0;
+}
+
+.markdown-preview figcaption {
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin-top: 6px;
+}
+
+.markdown-preview .table-wrap {
+  margin: 12px 0;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  overflow-x: auto;
+  background: #fff;
 }
 
 .markdown-preview table {
   width: 100%;
   border-collapse: collapse;
-  margin-bottom: 12px;
+  margin: 0;
+  font-size: 0.95rem;
+  min-width: 520px;
 }
 
 .markdown-preview th,
@@ -482,8 +601,87 @@ a.btn:focus-visible {
   border: 1px solid var(--line);
   padding: 8px;
   text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
 }
 
+.markdown-preview th {
+  background: #f8f4ed;
+  font-weight: 600;
+}
+
+.markdown-preview tbody tr:nth-child(even) {
+  background: #fbf8f2;
+}
+
+.markdown-preview table caption {
+  caption-side: bottom;
+  padding: 8px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.markdown-preview dl {
+  margin: 0 0 12px 0;
+}
+
+.markdown-preview dt {
+  font-weight: 700;
+  margin-top: 8px;
+}
+
+.markdown-preview dd {
+  margin: 0 0 8px 16px;
+  color: var(--muted);
+}
+
+.markdown-preview del {
+  color: var(--muted);
+}
+
+.markdown-preview kbd {
+  font-family: "IBM Plex Mono", "Courier New", monospace;
+  background: #f6f2ea;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 0.9em;
+}
+
+.markdown-preview input[type="checkbox"] {
+  margin-right: 6px;
+}
+
+.markdown-preview .task-list {
+  list-style: none;
+  padding-left: 0;
+  margin-left: 0;
+}
+
+.markdown-preview .task-list-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 0;
+}
+
+.markdown-preview .footnotes {
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.markdown-preview .footnotes-sep {
+  border: 0;
+  height: 1px;
+  background: var(--line);
+  margin: 16px 0;
+}
+
+.markdown-preview .footnote-ref a,
+.markdown-preview .footnote-backref {
+  color: var(--accent-3);
+  text-decoration: none;
+}
 .raw-output {
   margin-top: 12px;
 }
@@ -619,9 +817,26 @@ class RenderRequest(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
-jinja_env = SandboxedEnvironment(autoescape=False, undefined=StrictUndefined)
+jinja_env = SandboxedEnvironment(
+    autoescape=False,
+    undefined=StrictUndefined,
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
 render_executor = ThreadPoolExecutor(max_workers=4)
-markdown_renderer = MarkdownIt("commonmark", {"html": False, "linkify": False})
+markdown_renderer = MarkdownIt("commonmark", {"html": False, "linkify": False}).enable(
+    ["table", "strikethrough"]
+)
+try:
+    from mdit_py_plugins.deflist import deflist
+    from mdit_py_plugins.footnote import footnote
+    from mdit_py_plugins.tasklists import tasklists
+
+    markdown_renderer.use(tasklists, enabled=True)
+    markdown_renderer.use(footnote)
+    markdown_renderer.use(deflist)
+except ModuleNotFoundError:
+    pass
 
 
 def validate_template_text(template_text: str) -> str | None:
@@ -903,6 +1118,8 @@ def render_markdown_preview(markdown: str) -> str:
     rendered = markdown_renderer.render(markdown)
     rendered = re.sub(r'href="javascript:[^"]*"', 'href="#"', rendered, flags=re.IGNORECASE)
     rendered = re.sub(r'src="javascript:[^"]*"', 'src=""', rendered, flags=re.IGNORECASE)
+    rendered = re.sub(r"<table>", '<div class="table-wrap"><table>', rendered)
+    rendered = re.sub(r"</table>", "</table></div>", rendered)
     return rendered
 
 

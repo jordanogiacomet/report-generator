@@ -1,0 +1,10 @@
+image: python:3.13-slim
+
+stages:
+  - verify
+
+verify:
+  stage: verify
+  script:
+    - python -V
+    - python -m compileall -q main.py db.py models.py config.py schemas.py

@@ -1,8 +1,12 @@
 from sqlmodel import SQLModel, create_engine, Session
 from sqlalchemy import text
 
-import models
-from config import settings
+try:
+    import models
+    from config import settings
+except ModuleNotFoundError:
+    from . import models
+    from .config import settings
 
 engine = create_engine(
     settings.DATABASE_URL,
