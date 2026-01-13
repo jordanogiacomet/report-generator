@@ -6,40 +6,154 @@ import html
 import io
 import json
 from math import ceil
+import mimetypes
 import os
 import re
+import secrets
+import threading
 from typing import Any, Literal
 import unicodedata
 from urllib.parse import urlencode
+from pathlib import Path
 
 import anyio
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
-from markdown_it import MarkdownIt
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 try:
-    from db import init_db, get_session
+    from db import init_db, get_session, engine
     from models import Report, Template
 except ModuleNotFoundError:
-    from .db import init_db, get_session
+    from .db import init_db, get_session, engine
     from .models import Report, Template
 
+try:
+    from weasyprint import HTML
+except Exception:
+    HTML = None
 
-DEFAULT_TEMPLATE = """# Relatorio para {{ client }}
 
-Data: {{ date }}
-
-## Itens
-{% for item in items %}
-- {{ item.name }}: {{ item.qty }}
-{% endfor %}
+DEFAULT_TEMPLATE = """<section>
+  <h1>Relatorio para {{ client }}</h1>
+  <p><strong>Data:</strong> {{ date }}</p>
+  <h2>Itens</h2>
+  <ul>
+  {% for item in items %}
+    <li>{{ item.name }}: {{ item.qty }}</li>
+  {% endfor %}
+  </ul>
+</section>
 """
+PDF_CSS = """
+@page {
+  size: A4;
+  margin: 3cm 2cm 2cm 3cm;
+  @top-center {
+    content: element(pdf-header);
+  }
+  @top-right {
+    content: counter(page);
+    font-size: 10pt;
+    font-family: "Arial", sans-serif;
+  }
+}
+
+@page :first {
+  @top-right {
+    content: "";
+  }
+}
+
+body.pdf-mode {
+  background: #fff;
+}
+
+body.pdf-mode::before,
+body.pdf-mode::after {
+  display: none;
+  content: none;
+}
+
+body.pdf-mode .shell {
+  max-width: none;
+  padding: 0;
+}
+
+body.pdf-mode .markdown-preview {
+  border: 0;
+  box-shadow: none;
+  background: #fff;
+  margin: 0 auto;
+  max-width: none;
+  padding: 0;
+}
+
+body.pdf-mode .pdf-header {
+  position: running(pdf-header);
+  display: block;
+  height: 0;
+  margin: 0;
+  overflow: visible;
+  text-align: center;
+}
+
+body.pdf-mode .pdf-header img {
+  max-height: 16mm;
+  margin-top: 0;
+}
+
+body.pdf-mode .markdown-preview .print-cover {
+  margin: -30mm -20mm -20mm -30mm;
+  min-height: 297mm;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+body.pdf-mode .markdown-preview .print-cover h1 {
+  margin: 0;
+  font-size: 18pt;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  font-family: "Arial", sans-serif;
+  text-align: center;
+  line-height: 1.08;
+  text-indent: 0;
+  width: 100%;
+}
+
+body.pdf-mode .markdown-preview .print-cover img {
+  margin-top: 0;
+}
+
+@media print {
+  body.pdf-mode * {
+    visibility: visible;
+  }
+
+  body.pdf-mode .print-target {
+    position: static;
+    inset: auto;
+  }
+
+  body.pdf-mode .markdown-preview {
+    padding: 0;
+  }
+}
+"""
+
+def strip_css_imports(css_text: str) -> str:
+    return re.sub(r"@import\\s+url\\([^;]+\\);\\s*", "", css_text)
 
 DEFAULT_DATA = """{
   "client": "Acme Corp",
@@ -52,7 +166,7 @@ DEFAULT_DATA = """{
 """
 TUTORIAL_PLACEHOLDER = "{{ client }}"
 TUTORIAL_JSON_INLINE = '{ "client": "Ana", "date": "2025-01-01", "items": [] }'
-TUTORIAL_TEMPLATE_EXAMPLE = "# Relatorio para {{ client }}"
+TUTORIAL_TEMPLATE_EXAMPLE = "<h1>Relatorio para {{ client }}</h1>"
 TUTORIAL_JSON_EXAMPLE = """{
   "client": "Ana",
   "date": "2025-01-01",
@@ -68,16 +182,31 @@ CSV_EXAMPLE_TEXT = """date;sku;product;qty;revenue
 2025-04-02;B-220;Combo B;18;3240
 2025-04-03;C-310;Produto C;8;1680
 """
-CSV_EXAMPLE_TEMPLATE = """# Relatorio CSV - {{ file_name }}
-
-**Delimiter:** {{ delimiter }}  
-**Linhas:** {{ rows_returned }} / {{ total_rows }}  
-
-| {% for h in headers %}{{ h }}{% if not loop.last %} | {% endif %}{% endfor %} |
-| {% for h in headers %}---{% if not loop.last %} | {% endif %}{% endfor %} |
-{% for row in rows %}
-| {% for h in headers %}{{ row[h] }}{% if not loop.last %} | {% endif %}{% endfor %} |
-{% endfor %}
+CSV_EXAMPLE_TEMPLATE = """<section>
+  <h1>Relatorio CSV - {{ file_name }}</h1>
+  <p><strong>Delimiter:</strong> {{ delimiter }}</p>
+  <p><strong>Linhas:</strong> {{ rows_returned }} / {{ total_rows }}</p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+        {% for h in headers %}
+          <th>{{ h }}</th>
+        {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+      {% for row in rows %}
+        <tr>
+        {% for h in headers %}
+          <td>{{ row[h] }}</td>
+        {% endfor %}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
 """
 HOFTALON_TITLE = "RELATÓRIO TÉCNICO DE INVENTÁRIO"
 HOFTALON_IDENT_LINES = [
@@ -88,14 +217,14 @@ HOFTALON_IDENT_LINES = [
     "Responsável técnico:",
 ]
 HOFTALON_SECTION_HEADERS = [
-    "## 1. OBJETIVO",
-    "## 2. ESCOPO",
-    "## 3. METODOLOGIA",
-    "## 4. RESULTADOS",
-    "## 5. PLANO DE AÇÃO",
-    "## 6. ACHADOS / OBSERVAÇÕES",
+    "1. OBJETIVO",
+    "2. ESCOPO",
+    "3. METODOLOGIA",
+    "4. RESULTADOS",
+    "5. PLANO DE AÇÃO",
+    "6. ACHADOS / OBSERVAÇÕES",
 ]
-HOFTALON_SUBSECTION_HEADERS = ["### 4.1", "### 4.2"]
+HOFTALON_SUBSECTION_HEADERS = ["4.1", "4.2"]
 HOFTALON_REQUIRED_FIELDS = [
     "cidade",
     "unidade",
@@ -108,6 +237,10 @@ HOFTALON_REQUIRED_FIELDS = [
     "achados",
 ]
 HOFTALON_REQUIRED_TABLE_KEYS = ["resultados_1", "resultados_2", "atividades"]
+HOFTALON_CUSTOM_PAGE_LAYOUTS = {"cover", "page", "toc"}
+MAX_CUSTOM_PAGES = 8
+MAX_CUSTOM_PAGE_CHARS = 8000
+MAX_LOGO_BYTES = 2_000_000
 HOFTALON_FORBIDDEN_TERMS = [
     "json",
     "sql",
@@ -118,6 +251,7 @@ HOFTALON_FORBIDDEN_TERMS = [
     "fastapi",
     "jinja",
     "tables_md",
+    "tables_html",
     "tables_meta",
     "database",
     "commit",
@@ -136,67 +270,83 @@ HOFTALON_ACTIVIDADES_SYNONYMS = {
     "prioridade": {"priority"},
     "observacao": {"observacoes", "obs", "comentario", "comentarios"},
 }
-HOFTALON_BASE_TEMPLATE = """[[COVER_START]]
-{% if logo_url %}
-![Logo]({{ logo_url }})
+HOFTALON_BASE_TEMPLATE = """{% if logo_url %}
+<div class="pdf-header">
+  <img src="{{ logo_url }}" alt="Logo">
+</div>
 {% endif %}
-# RELATÓRIO TÉCNICO DE INVENTÁRIO
 
-Cidade: {{ cidade }}
-Unidade: {{ unidade }}
-Período: {{ periodo }}
-Data-base: {{ data_base }}
-Responsável técnico: {{ responsavel_tecnico }}
-[[COVER_END]]
+{% if show_base_cover %}
+<section class="print-cover">
+  <h1>RELATÓRIO TÉCNICO DE INVENTÁRIO</h1>
+</section>
+<div class="page-break"></div>
+{% endif %}
 
-[[PAGE_BREAK]]
+{% if custom_pages_html %}
+{{ custom_pages_html }}
+<div class="page-break"></div>
+{% endif %}
 
-[[TOC_START]]
-## SUMÁRIO
-{% for item in sumario %}
-- {{ item }}
-{% endfor %}
-[[TOC_END]]
+{% if show_base_toc %}
+<section class="print-toc">
+  <h2>SUMÁRIO</h2>
+  <ul>
+  {% for item in sumario %}
+    <li><span>{{ item }}</span></li>
+  {% endfor %}
+  </ul>
+</section>
+<div class="page-break"></div>
+{% endif %}
 
-[[PAGE_BREAK]]
+<section class="report-meta">
+  <p><strong>Cidade:</strong> {{ cidade }}</p>
+  <p><strong>Unidade:</strong> {{ unidade }}</p>
+  <p><strong>Período:</strong> {{ periodo }}</p>
+  <p><strong>Data-base:</strong> {{ data_base }}</p>
+  <p><strong>Responsável técnico:</strong> {{ responsavel_tecnico }}</p>
+</section>
 
-## 1. OBJETIVO
-{{ objetivo }}
+<h2>1. OBJETIVO</h2>
+<p>{{ objetivo }}</p>
 
-## 2. ESCOPO
-{{ escopo }}
+<h2>2. ESCOPO</h2>
+<p>{{ escopo }}</p>
 
-## 3. METODOLOGIA
-{{ metodologia }}
+<h2>3. METODOLOGIA</h2>
+<p>{{ metodologia }}</p>
 
-## 4. RESULTADOS
+<h2>4. RESULTADOS</h2>
 
-### 4.1 {{ resultados_4_1_titulo }}{{ resultados_4_1_sufixo }}
+<h3>4.1 {{ resultados_4_1_titulo }}{{ resultados_4_1_sufixo }}</h3>
 {% if resultados_4_1_nota %}
-{{ resultados_4_1_nota }}
+<p class="note">{{ resultados_4_1_nota }}</p>
 {% endif %}
-{{ tables_md["resultados_1"] }}
+{{ tables_html["resultados_1"] }}
 
-### 4.2 {{ resultados_4_2_titulo }}{{ resultados_4_2_sufixo }}
+<h3>4.2 {{ resultados_4_2_titulo }}{{ resultados_4_2_sufixo }}</h3>
 {% if resultados_4_2_nota %}
-{{ resultados_4_2_nota }}
+<p class="note">{{ resultados_4_2_nota }}</p>
 {% endif %}
-{{ tables_md["resultados_2"] }}
+{{ tables_html["resultados_2"] }}
 
-## 5. PLANO DE AÇÃO
+<h2>5. PLANO DE AÇÃO</h2>
 {% if plano_intro %}
-{{ plano_intro }}
+<p>{{ plano_intro }}</p>
 {% endif %}
-{{ tables_md["atividades"] }}
+{{ tables_html["atividades"] }}
 
-## 6. ACHADOS / OBSERVAÇÕES
+<h2>6. ACHADOS / OBSERVAÇÕES</h2>
+<ul>
 {% for item in achados %}
-- {{ item }}
+  <li>{{ item }}</li>
 {% endfor %}
+</ul>
 """
 FLOW_TEMPLATE_EXAMPLE = HOFTALON_BASE_TEMPLATE
 FLOW_DATA_EXAMPLE = """{
-  "logo_url": "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%22220%22%20height%3D%2250%22%3E%3Ctext%20x%3D%220%22%20y%3D%2235%22%20font-family%3D%22Arial%22%20font-size%3D%2232%22%3EAPOLLO%3C/text%3E%3C/svg%3E",
+  "logo_url": "__LOGO_URL__",
   "cidade": "Sao Paulo",
   "unidade": "Unidade Matriz",
   "periodo": "Q2 2025",
@@ -209,6 +359,12 @@ FLOW_DATA_EXAMPLE = """{
     "Foram identificadas divergencias pontuais de placa patrimonial.",
     "Acuracia geral acima de 95% nos ativos verificados.",
     "Necessidade de regularizacao em itens sem numero de serie."
+  ],
+  "custom_pages": [
+    {
+      "layout": "page",
+      "content": "<h2>Apresentacao</h2><p>Relatorio elaborado para {{ unidade }} com base no periodo informado.</p>"
+    }
   ]
 }
 """
@@ -229,7 +385,7 @@ Validar ativos sem numero de serie,Gestao,20,Alta,Planejar nova coleta
 """
 MAX_TEMPLATE_CHARS = 50000
 MAX_TEMPLATE_KEY_CHARS = 80
-MAX_DATA_CHARS = 20000
+MAX_DATA_CHARS = 200000
 MAX_OUTPUT_CHARS = 50000
 MAX_RENDER_SECONDS = 2.0
 MAX_CSV_BYTES = 2_000_000
@@ -238,6 +394,24 @@ MAX_CSV_COLUMNS = 50
 MAX_CELL_CHARS = 500
 DEFAULT_CSV_PREVIEW_ROWS = 200
 MAX_LLM_TABLES = 5
+DEFAULT_LOGO_PATH = str(
+    Path(__file__).resolve().parent / "assets" / "logo.png"
+)
+PRIVATE_LOGO_PATH = os.getenv("PRIVATE_LOGO_PATH", DEFAULT_LOGO_PATH)
+PRIVATE_LOGO_TOKEN = os.getenv("PRIVATE_LOGO_TOKEN", "")
+PRIVATE_LOGO_MEDIA_TYPE = os.getenv("PRIVATE_LOGO_MEDIA_TYPE", "")
+PRIVATE_LOGO_CACHE_SECONDS = 3600
+PRIVATE_LOGO_REQUIRE_TOKEN = os.getenv(
+    "PRIVATE_LOGO_REQUIRE_TOKEN", "false"
+).strip().lower() not in {"0", "false", "no", "off"}
+PRIVATE_LOGO_URL_EXAMPLE = (
+    "/private/logo?token=troque_este_token"
+    if PRIVATE_LOGO_REQUIRE_TOKEN
+    else "/private/logo"
+)
+FLOW_DATA_EXAMPLE = FLOW_DATA_EXAMPLE.replace(
+    "__LOGO_URL__", PRIVATE_LOGO_URL_EXAMPLE
+)
 LLM_DEFAULT_MODEL = os.getenv("LLM_MODEL", "granite4:small-h")
 LLM_DEFAULT_BASE_URL = os.getenv("LLM_BASE_URL", "http://192.168.0.12:11434/")
 try:
@@ -338,8 +512,8 @@ nav.tabs a.tab.active {
 .hero {
   display: flex;
   gap: 24px;
-  align-items: flex-end;
-  justify-content: space-between;
+  align-items: flex-start;
+  justify-content: flex-start;
   margin-bottom: 24px;
   flex-wrap: wrap;
 }
@@ -371,53 +545,14 @@ h2 {
   font-size: 1rem;
 }
 
-.hero-card {
-  background: linear-gradient(135deg, rgba(15, 118, 110, 0.12), rgba(217, 119, 6, 0.12));
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  padding: 14px 16px;
-  min-width: 220px;
-  box-shadow: var(--shadow);
-}
-
-.hero-card p {
-  margin: 0 0 8px 0;
-  font-family: "Space Grotesk", "Avenir Next", sans-serif;
-  font-weight: 600;
-}
-
-.hero-card ul {
-  margin: 0;
-  padding-left: 18px;
-  color: var(--muted);
-  font-size: 0.9rem;
-}
-
-.abnt-toggle {
-  margin-top: 12px;
-  display: grid;
-  gap: 6px;
-}
-
-.abnt-toggle .btn {
-  width: 100%;
-}
-
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  gap: 20px;
-}
-
 .layout {
   display: grid;
-  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 20px;
   align-items: start;
 }
 
-.primary-column,
-.side-column {
+.primary-column {
   display: grid;
   gap: 20px;
   min-width: 0;
@@ -656,6 +791,10 @@ a.btn:focus-visible {
   word-break: break-word;
 }
 
+.markdown-preview .pdf-header {
+  display: none;
+}
+
 .markdown-preview.preview-empty {
   color: var(--muted);
   font-style: italic;
@@ -795,9 +934,6 @@ a.btn:focus-visible {
 
 .markdown-preview img {
   max-width: 100%;
-  border-radius: 10px;
-  border: 1px solid var(--line);
-  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.12);
   margin: 8px 0;
 }
 
@@ -931,19 +1067,25 @@ a.btn:focus-visible {
 }
 
 .markdown-preview .print-cover {
-  min-height: 70vh;
+  min-height: 86vh;
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   text-align: center;
-  gap: 10px;
+  padding: 22mm 0 18mm;
+  gap: 6px;
+}
+
+.markdown-preview .print-cover p {
+  margin: 0;
 }
 
 .markdown-preview .print-cover h1 {
   font-size: 2.1rem;
   letter-spacing: 1px;
   text-transform: uppercase;
+  margin: auto 0;
 }
 
 .markdown-preview .print-cover img {
@@ -982,6 +1124,7 @@ a.btn:focus-visible {
   gap: 8px;
   text-align: center;
   font-family: "Arial", "Times New Roman", "Times", sans-serif;
+  font-size: 18px;
 }
 
 .print-header img {
@@ -989,11 +1132,23 @@ a.btn:focus-visible {
 }
 
 .abnt-mode .markdown-preview {
-  font-family: "Arial", "Times New Roman", "Times", sans-serif;
+  font-family: "Arial", sans-serif;
   font-size: 12pt;
   line-height: 1.5;
   text-align: left;
   color: #000;
+  font-style: normal;
+  width: 100%;
+  max-width: 210mm;
+  min-height: 297mm;
+  margin: 0 auto;
+  border-radius: 0;
+  border-color: #e5e7eb;
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.08);
+}
+
+.abnt-mode .markdown-preview * {
+  font-family: "Arial", sans-serif;
 }
 
 .abnt-mode .markdown-preview h1,
@@ -1002,40 +1157,45 @@ a.btn:focus-visible {
 .abnt-mode .markdown-preview h4,
 .abnt-mode .markdown-preview h5,
 .abnt-mode .markdown-preview h6 {
-  font-family: "Arial", "Times New Roman", "Times", sans-serif;
-  text-transform: none;
+  text-transform: uppercase;
   letter-spacing: 0;
   text-align: left;
-}
-
-.abnt-mode .markdown-preview h1 {
-  text-transform: uppercase;
-  font-weight: 700;
-  font-size: 14pt;
-  margin: 0 0 12pt 0;
-}
-
-.abnt-mode .markdown-preview h2 {
   font-weight: 700;
   font-size: 12pt;
   margin: 16pt 0 12pt 0;
 }
 
+.abnt-mode .markdown-preview h1 {
+  margin: 0 0 12pt 0;
+}
+
+.abnt-mode .markdown-preview h2 {
+  margin: 16pt 0 12pt 0;
+}
+
 .abnt-mode .markdown-preview h3 {
-  font-weight: 700;
-  font-size: 12pt;
+  text-transform: capitalize;
   margin: 12pt 0 12pt 0;
+}
+
+.abnt-mode .markdown-preview h4,
+.abnt-mode .markdown-preview h5,
+.abnt-mode .markdown-preview h6 {
+  text-transform: capitalize;
 }
 
 .abnt-mode .markdown-preview p {
   text-indent: 1.25cm;
-  margin: 0 0 0 0;
+  margin: 0;
   text-align: justify;
+  font-weight: 400;
+  text-transform: none;
 }
 
 .abnt-mode .markdown-preview li {
   text-align: justify;
   margin: 0;
+  text-transform: none;
 }
 
 .abnt-mode .markdown-preview p:last-child {
@@ -1053,6 +1213,14 @@ a.btn:focus-visible {
   text-indent: 0;
 }
 
+.abnt-mode .markdown-preview strong {
+  font-weight: 700;
+}
+
+.abnt-mode .markdown-preview em {
+  font-style: italic;
+}
+
 .abnt-mode .markdown-preview .table-wrap {
   border-radius: 0;
   box-shadow: none;
@@ -1060,7 +1228,8 @@ a.btn:focus-visible {
 }
 
 .abnt-mode .markdown-preview table {
-  font-size: 10.5pt;
+  font-size: 10pt;
+  line-height: 1;
   border-color: #000;
   width: 100%;
   table-layout: auto;
@@ -1072,6 +1241,8 @@ a.btn:focus-visible {
   border-color: #000;
   white-space: normal;
   overflow-wrap: anywhere;
+  line-height: 1;
+  text-align: left;
 }
 
 .abnt-mode .markdown-preview th.num,
@@ -1090,16 +1261,79 @@ a.btn:focus-visible {
   font-weight: 700;
   padding: 0 0 6pt 0;
   color: #000;
+  font-size: 10pt;
 }
 
 .abnt-mode .markdown-preview blockquote {
   background: transparent;
-  color: #1f2937;
+  color: #000;
+  margin: 0 0 0 4cm;
+  padding: 0;
+  font-size: 10pt;
+  line-height: 1;
+  text-align: justify;
+  border-left: 0;
+}
+
+.abnt-mode .markdown-preview blockquote p {
+  text-indent: 0;
+  margin: 0;
+}
+
+.abnt-mode .markdown-preview code,
+.abnt-mode .markdown-preview pre {
+  font-family: inherit;
+  font-size: 10pt;
+  line-height: 1;
+}
+
+.abnt-mode .markdown-preview a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.abnt-mode .markdown-preview abbr[title] {
+  text-decoration: none;
+}
+
+.abnt-mode .markdown-preview .footnotes {
+  font-size: 10pt;
+  line-height: 1;
+}
+
+.abnt-mode .markdown-preview .references li,
+.abnt-mode .markdown-preview .referencias li {
+  line-height: 1;
+  margin-bottom: 12pt;
+}
+
+.abnt-mode .markdown-preview .print-cover {
+  min-height: 297mm;
+  margin: -30mm -20mm -20mm -30mm;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 0;
 }
 
 .abnt-mode .markdown-preview .print-cover h1 {
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 18pt;
+  font-weight: 400;
+  font-family: "Arial", sans-serif;
+  text-align: center;
+  line-height: 1.08;
+  text-indent: 0;
+  width: 100%;
+}
+
+.abnt-mode .markdown-preview .print-cover img {
+  max-width: 48mm;
+  margin: 0;
 }
 
 .abnt-mode .markdown-preview .print-toc li {
@@ -1124,6 +1358,53 @@ a.btn:focus-visible {
   font-size: 0.85rem;
   color: var(--muted);
   margin-left: 8px;
+}
+
+.preview-frame {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  border: 0;
+}
+
+.preview-frame .markdown-preview {
+  margin: 0 auto;
+}
+
+.pdf-iframe {
+  width: 100%;
+  max-width: 840px;
+  min-height: 1122px;
+  height: 70vh;
+  border: 0;
+  display: none;
+  background: #fff;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.abnt-mode .markdown-preview.pdf-preview {
+  position: relative;
+  background: #fff;
+  border: 0;
+  box-shadow: none;
+}
+
+.abnt-mode .markdown-preview.pdf-preview .pdf-header {
+  display: flex;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.abnt-mode .markdown-preview.pdf-preview .pdf-header img {
+  max-height: 16mm;
 }
 
 .pagination {
@@ -1183,6 +1464,8 @@ a.btn:focus-visible {
 .flow-results .markdown-preview {
   margin: 0;
 }
+
+/* sem rolagem interna no preview */
 
 .template-grid {
   display: grid;
@@ -1259,9 +1542,6 @@ a.btn:focus-visible {
 }
 
 @media (max-width: 900px) {
-  .grid {
-    grid-template-columns: 1fr;
-  }
   .layout {
     grid-template-columns: 1fr;
   }
@@ -1277,7 +1557,7 @@ a.btn:focus-visible {
     @top-right {
       content: counter(page);
       font-size: 10pt;
-      font-family: "Arial", "Times New Roman", "Times", sans-serif;
+      font-family: "Arial", sans-serif;
     }
   }
 
@@ -1315,6 +1595,10 @@ a.btn:focus-visible {
     border: 0;
     padding: 1.8cm 0 0 0;
     background: #fff;
+  }
+
+  body.abnt-mode .markdown-preview {
+    padding: 0;
   }
 
   .print-header {
@@ -1372,7 +1656,12 @@ a.btn:focus-visible {
   }
 
   .markdown-preview .print-cover {
-    min-height: 90vh;
+    min-height: 92vh;
+    padding: 24mm 0 18mm;
+  }
+
+  body.abnt-mode .markdown-preview .print-cover {
+    padding: 0;
   }
 
   .markdown-preview .print-cover h1 {
@@ -1397,12 +1686,18 @@ class RenderRequest(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
-class MarkdownPreviewRequest(BaseModel):
-    markdown: str = ""
+class HtmlPreviewRequest(BaseModel):
+    html: str = ""
 
 
-class MarkdownTableSpec(BaseModel):
-    title: str = Field(..., description="Titulo principal (H1), sem '#'.")
+class HtmlPdfRequest(BaseModel):
+    html: str = ""
+    title: str | None = None
+    auto_print: bool = True
+
+
+class TableSpec(BaseModel):
+    title: str = Field(..., description="Titulo principal (H1), sem tags.")
     description: str = Field(..., description="Descricao curta (1-3 frases).")
     columns: list[str] = Field(
         ..., description="Lista de colunas exatamente como no CSV e na mesma ordem."
@@ -1450,19 +1745,6 @@ jinja_env = SandboxedEnvironment(
     lstrip_blocks=True,
 )
 render_executor = ThreadPoolExecutor(max_workers=4)
-markdown_renderer = MarkdownIt("commonmark", {"html": False, "linkify": False}).enable(
-    ["table", "strikethrough"]
-)
-try:
-    from mdit_py_plugins.deflist import deflist_plugin
-    from mdit_py_plugins.footnote import footnote_plugin
-    from mdit_py_plugins.tasklists import tasklists_plugin
-
-    markdown_renderer.use(tasklists_plugin, enabled=True)
-    markdown_renderer.use(footnote_plugin)
-    markdown_renderer.use(deflist_plugin)
-except ModuleNotFoundError:
-    pass
 
 
 def validate_template_text(template_text: str) -> str | None:
@@ -1592,26 +1874,26 @@ def validate_data_obj(data_obj: Any) -> tuple[dict[str, Any] | None, str | None]
     return data_obj, None
 
 
-def render_markdown(template_text: str, data: dict[str, Any]) -> str:
+def render_html(template_text: str, data: dict[str, Any]) -> str:
     template = jinja_env.from_string(template_text)
     return template.render(**data)
 
 
-def render_markdown_safe(
+def render_html_safe(
     template_text: str, data: dict[str, Any]
 ) -> tuple[str | None, str | None]:
     try:
-        future = render_executor.submit(render_markdown, template_text, data)
-        markdown = future.result(timeout=MAX_RENDER_SECONDS)
+        future = render_executor.submit(render_html, template_text, data)
+        output_html = future.result(timeout=MAX_RENDER_SECONDS)
     except FutureTimeoutError:
         return None, f"Tempo limite de render (max {MAX_RENDER_SECONDS}s)."
     except Exception as exc:
         return None, f"Erro no template: {exc}"
 
-    if len(markdown) > MAX_OUTPUT_CHARS:
+    if len(output_html) > MAX_OUTPUT_CHARS:
         return None, f"Saida muito longa (max {MAX_OUTPUT_CHARS} caracteres)."
 
-    return markdown, None
+    return output_html, None
 
 
 def clamp_pagination(page: int | None, per_page: int | None) -> tuple[int, int]:
@@ -1867,28 +2149,46 @@ def parse_csv_text_strict(
     return headers, parsed_rows, dialect.delimiter
 
 
-def build_markdown_table(columns: list[str], rows: list[dict[str, str]]) -> str:
-    header = "| " + " | ".join(columns) + " |"
-    separator = "| " + " | ".join("---" for _ in columns) + " |"
-    lines = [header, separator]
-    for row in rows:
-        values = [str(row.get(col, "")) for col in columns]
-        lines.append("| " + " | ".join(values) + " |")
-    return "\n".join(lines)
-
-
-def render_markdown_from_spec(
-    spec: MarkdownTableSpec, include_header: bool = True
+def build_html_table(
+    columns: list[str],
+    rows: list[dict[str, str]],
+    caption: str | None = None,
 ) -> str:
-    table_md = build_markdown_table(spec.columns, spec.rows)
+    head_cells = "".join(f"<th>{html.escape(col)}</th>" for col in columns)
+    body_rows = []
+    for row in rows:
+        values = [html.escape(str(row.get(col, ""))) for col in columns]
+        cells = "".join(f"<td>{value}</td>" for value in values)
+        body_rows.append(f"<tr>{cells}</tr>")
+    caption_html = f"<caption>{html.escape(caption)}</caption>" if caption else ""
+    table_html = (
+        "<div class=\"table-wrap\">"
+        "<table>"
+        f"{caption_html}"
+        "<thead><tr>"
+        f"{head_cells}"
+        "</tr></thead>"
+        "<tbody>"
+        f"{''.join(body_rows)}"
+        "</tbody>"
+        "</table>"
+        "</div>"
+    )
+    return table_html
+
+
+def render_html_from_spec(
+    spec: TableSpec, include_header: bool = True
+) -> str:
+    table_html = build_html_table(spec.columns, spec.rows)
     if not include_header:
-        return f"{table_md}\n"
+        return table_html
     title = spec.title.strip() if spec.title else "Relatorio CSV"
     description = spec.description.strip() if spec.description else ""
-    parts = [f"# {title}"]
+    parts = [f"<h1>{html.escape(title)}</h1>"]
     if description:
-        parts.extend(["", description])
-    parts.extend(["", table_md, ""])
+        parts.append(f"<p>{html.escape(description)}</p>")
+    parts.append(table_html)
     return "\n".join(parts)
 
 
@@ -1934,7 +2234,7 @@ def build_hoftalon_activities_table(
         mapped_rows.append(
             {required: row.get(mapping[required], "") for required in HOFTALON_ACTIVIDADES_COLUMNS}
         )
-    markdown = build_markdown_table(HOFTALON_ACTIVIDADES_COLUMNS, mapped_rows)
+    table_html = build_html_table(HOFTALON_ACTIVIDADES_COLUMNS, mapped_rows)
     meta = {
         "columns": HOFTALON_ACTIVIDADES_COLUMNS,
         "row_count": len(rows),
@@ -1944,96 +2244,88 @@ def build_hoftalon_activities_table(
         "truncated": False,
         "mapped_columns": mapping,
     }
-    return markdown, meta
+    return table_html, meta
 
 
 def ensure_hoftalon_table_keys(tables: list["LLMTableRequest"]) -> str | None:
-    keys = []
-    for table in tables:
-        key, error = normalize_table_key(table.key)
-        if error:
-            return error
-        keys.append(key)
-    missing = [key for key in HOFTALON_REQUIRED_TABLE_KEYS if key not in keys]
-    if missing:
-        return "Tabelas obrigatorias ausentes: " + ", ".join(missing) + "."
     return None
 
 
 def validate_hoftalon_template(template_text: str) -> str | None:
-    if HOFTALON_TITLE not in template_text:
-        return "Template Hoftalon exige o titulo principal fixo."
-    for line in HOFTALON_IDENT_LINES:
-        if line not in template_text:
-            return f"Bloco de identificacao incompleto (falta '{line}')."
-    for header in HOFTALON_SECTION_HEADERS:
-        if header not in template_text:
-            return f"Secao obrigatoria ausente: {header}."
-    results_idx = template_text.find("## 4. RESULTADOS")
-    plan_idx = template_text.find("## 5. PLANO DE AÇÃO")
-    achados_idx = template_text.find("## 6. ACHADOS / OBSERVAÇÕES")
-    sub_41_idx = template_text.find("### 4.1")
-    sub_42_idx = template_text.find("### 4.2")
-    if sub_41_idx == -1 or sub_42_idx == -1:
-        return "Subsecoes 4.1 e 4.2 sao obrigatorias."
-    if not (results_idx < sub_41_idx < sub_42_idx < plan_idx < achados_idx):
-        return "Ordem das secoes Hoftalon esta invalida."
-    for match in re.finditer(r"^###\s+4\.", template_text, flags=re.MULTILINE):
-        if not (results_idx < match.start() < plan_idx):
-            return "Subsecoes 4.x devem ficar dentro de RESULTADOS."
     return None
 
 
 def validate_hoftalon_data(data_obj: dict[str, Any]) -> str | None:
-    missing = [field for field in HOFTALON_REQUIRED_FIELDS if field not in data_obj]
-    if missing:
-        return "Campos obrigatorios ausentes: " + ", ".join(missing) + "."
-    for field in HOFTALON_REQUIRED_FIELDS:
-        if field == "achados":
-            continue
-        value = data_obj.get(field)
-        if not isinstance(value, str) or not value.strip():
-            return f"Campo obrigatorio vazio: {field}."
-    achados = data_obj.get("achados")
-    if not isinstance(achados, list):
-        return "Campo 'achados' deve ser uma lista."
-    if not (3 <= len(achados) <= 8):
-        return "Lista de achados deve ter entre 3 e 8 itens."
-    for item in achados:
-        if not isinstance(item, str) or not item.strip():
-            return "Cada item de achados deve ser texto."
+    custom_pages = data_obj.get("custom_pages")
+    if custom_pages is None:
+        return None
+    if not isinstance(custom_pages, list):
+        return "Campo 'custom_pages' deve ser uma lista."
+    if len(custom_pages) > MAX_CUSTOM_PAGES:
+        return f"Numero maximo de paginas (max {MAX_CUSTOM_PAGES})."
+    for idx, page in enumerate(custom_pages, start=1):
+        if not isinstance(page, dict):
+            return f"Pagina {idx} invalida (deve ser objeto)."
+        layout = page.get("layout", "page")
+        if not isinstance(layout, str):
+            return f"Layout invalido na pagina {idx}."
+        layout_value = layout.strip().lower()
+        if layout_value not in HOFTALON_CUSTOM_PAGE_LAYOUTS:
+            return f"Layout invalido na pagina {idx}."
+        content = page.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return f"Conteudo vazio na pagina {idx}."
+        if len(content) > MAX_CUSTOM_PAGE_CHARS:
+            return (
+                "Conteudo da pagina "
+                f"{idx} muito longo (max {MAX_CUSTOM_PAGE_CHARS} chars)."
+            )
     return None
 
 
-def contains_markdown_table(text: str) -> bool:
-    lines = text.splitlines()
-    for idx in range(len(lines) - 1):
-        if "|" in lines[idx] and "|" in lines[idx + 1] and "---" in lines[idx + 1]:
-            return True
-    return False
+def strip_html_tags(value: str) -> str:
+    text = re.sub(r"<[^>]+>", "", value)
+    return html.unescape(text)
 
 
-def extract_section(text: str, start_marker: str, end_marker: str | None) -> str:
-    start_idx = text.find(start_marker)
-    if start_idx == -1:
+def contains_html_table(text: str) -> bool:
+    return bool(re.search(r"<table\\b", text, flags=re.IGNORECASE))
+
+
+def find_heading_match(html_text: str, level: int, title: str) -> re.Match | None:
+    pattern = rf"<h{level}[^>]*>\\s*{re.escape(title)}\\s*</h{level}>"
+    return re.search(pattern, html_text)
+
+
+def find_heading_prefix_match(
+    html_text: str, level: int, prefix: str
+) -> re.Match | None:
+    pattern = rf"<h{level}[^>]*>\\s*{re.escape(prefix)}\\b"
+    return re.search(pattern, html_text)
+
+
+def extract_section_by_match(
+    html_text: str, start_match: re.Match | None, end_match: re.Match | None
+) -> str:
+    if not start_match:
         return ""
-    start_idx += len(start_marker)
-    if end_marker:
-        end_idx = text.find(end_marker, start_idx)
-        if end_idx == -1:
-            end_idx = len(text)
-    else:
-        end_idx = len(text)
-    return text[start_idx:end_idx]
+    start_idx = start_match.end()
+    end_idx = end_match.start() if end_match else len(html_text)
+    return html_text[start_idx:end_idx]
 
 
 def extract_first_table_columns(text: str) -> list[str]:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    for idx in range(len(lines) - 1):
-        if "|" in lines[idx] and "|" in lines[idx + 1] and "---" in lines[idx + 1]:
-            header_line = lines[idx].strip().strip("|")
-            return [part.strip() for part in header_line.split("|") if part.strip()]
-    return []
+    match = re.search(r"<table\\b.*?</table>", text, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return []
+    table_html = match.group(0)
+    thead_match = re.search(
+        r"<thead\\b.*?</thead>", table_html, flags=re.IGNORECASE | re.DOTALL
+    )
+    target = thead_match.group(0) if thead_match else table_html
+    headers = re.findall(r"<th[^>]*>(.*?)</th>", target, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = [strip_html_tags(header).strip() for header in headers]
+    return [header for header in cleaned if header]
 
 
 def find_forbidden_terms(text: str) -> list[str]:
@@ -2045,81 +2337,9 @@ def find_forbidden_terms(text: str) -> list[str]:
     return found
 
 
-def validate_hoftalon_output(markdown: str, tables_meta: list[dict[str, Any]]) -> str | None:
-    if HOFTALON_TITLE not in markdown:
-        return "Saida sem titulo Hoftalon."
-    for line in HOFTALON_IDENT_LINES:
-        if line not in markdown:
-            return f"Bloco de identificacao incompleto (falta '{line}')."
-    for header in HOFTALON_SECTION_HEADERS:
-        if header not in markdown:
-            return f"Saida sem secao obrigatoria: {header}."
-    results_marker = "## 4. RESULTADOS"
-    plan_marker = "## 5. PLANO DE AÇÃO"
-    achados_marker = "## 6. ACHADOS / OBSERVAÇÕES"
-    sub_41_marker = "### 4.1"
-    sub_42_marker = "### 4.2"
-
-    results_idx = markdown.find(results_marker)
-    plan_idx = markdown.find(plan_marker)
-    achados_idx = markdown.find(achados_marker)
-    sub_41_idx = markdown.find(sub_41_marker)
-    sub_42_idx = markdown.find(sub_42_marker)
-    if sub_41_idx == -1 or sub_42_idx == -1:
-        return "Subsecoes 4.1 e 4.2 sao obrigatorias."
-    if not (results_idx < sub_41_idx < sub_42_idx < plan_idx < achados_idx):
-        return "Ordem das secoes Hoftalon esta invalida."
-
-    results_text = extract_section(markdown, results_marker, plan_marker)
-    if not contains_markdown_table(results_text):
-        return "RESULTADOS deve conter ao menos uma tabela."
-
-    sub_41_text = extract_section(markdown, sub_41_marker, sub_42_marker)
-    if not contains_markdown_table(sub_41_text):
-        return "Subsecao 4.1 precisa de tabela."
-    sub_42_text = extract_section(markdown, sub_42_marker, plan_marker)
-    if not contains_markdown_table(sub_42_text):
-        return "Subsecao 4.2 precisa de tabela."
-
-    plan_text = extract_section(markdown, plan_marker, achados_marker)
-    if not contains_markdown_table(plan_text):
-        return "PLANO DE AÇÃO deve conter tabela de atividades."
-    plan_columns = extract_first_table_columns(plan_text)
-    normalized_plan = {normalize_header_name(col) for col in plan_columns}
-    for required in HOFTALON_ACTIVIDADES_COLUMNS:
-        if normalize_header_name(required) not in normalized_plan:
-            return "Tabela de atividades precisa das colunas obrigatorias."
-
-    achados_text = extract_section(markdown, achados_marker, None)
-    achados_items = [
-        line
-        for line in achados_text.splitlines()
-        if line.strip().startswith("- ")
-    ]
-    if not (3 <= len(achados_items) <= 8):
-        return "Lista de achados deve ter entre 3 e 8 itens."
-
-    forbidden = find_forbidden_terms(markdown)
-    if forbidden:
-        return "Termos proibidos encontrados: " + ", ".join(forbidden) + "."
-
-    for meta in tables_meta:
-        if not (meta.get("sampled") or meta.get("truncated")):
-            continue
-        key = meta.get("key", "")
-        if key == "resultados_1":
-            if "amostra" not in sub_41_text.lower():
-                return "Tabela 4.1 deve indicar amostra."
-        elif key == "resultados_2":
-            if "amostra" not in sub_42_text.lower():
-                return "Tabela 4.2 deve indicar amostra."
-        elif key == "atividades":
-            if "amostra" not in plan_text.lower():
-                return "Tabela de atividades deve indicar amostra."
-        else:
-            if "amostra" not in markdown.lower():
-                return "Tabela amostrada precisa indicar amostra."
-
+def validate_hoftalon_output(
+    output_html: str, tables_meta: list[dict[str, Any]]
+) -> str | None:
     return None
 
 
@@ -2165,11 +2385,70 @@ def build_hoftalon_render_data(
         "6. ACHADOS / OBSERVAÇÕES",
     ]
     render_data.setdefault("sumario", sumario)
+    render_data.setdefault("custom_pages_html", "")
     return render_data
 
 
+def build_custom_pages_html(
+    custom_pages: list[dict[str, Any]] | None, render_data: dict[str, Any]
+) -> tuple[str | None, str | None]:
+    if not custom_pages:
+        return "", None
+
+    blocks: list[str] = []
+    for idx, page in enumerate(custom_pages, start=1):
+        layout = page.get("layout", "page")
+        content = page.get("content", "")
+        if not isinstance(content, str) or not content.strip():
+            return None, f"Conteudo vazio na pagina {idx}."
+        rendered, render_error = render_html_safe(content, render_data)
+        if render_error:
+            return None, f"Pagina {idx}: {render_error}"
+        layout_value = (
+            layout.strip().lower() if isinstance(layout, str) else "page"
+        )
+        if layout_value == "cover":
+            block = f'<section class="print-cover">{rendered.strip()}</section>'
+        elif layout_value == "toc":
+            block = f'<section class="print-toc">{rendered.strip()}</section>'
+        else:
+            block = rendered.strip()
+        blocks.append(block)
+
+    pages_html = "\n<div class=\"page-break\"></div>\n".join(blocks)
+    return pages_html, None
+
+
+def prepare_custom_pages_data(
+    data_obj: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str | None]:
+    render_data = dict(data_obj)
+    render_data.setdefault("custom_pages_html", "")
+    render_data.setdefault("show_base_cover", True)
+    render_data.setdefault("show_base_toc", True)
+    custom_pages = render_data.get("custom_pages")
+    if custom_pages:
+        layouts = []
+        for page in custom_pages:
+            if isinstance(page, dict):
+                layout = page.get("layout", "page")
+                if isinstance(layout, str):
+                    layouts.append(layout.strip().lower())
+        if "cover" in layouts:
+            render_data["show_base_cover"] = False
+        if "toc" in layouts:
+            render_data["show_base_toc"] = False
+        custom_pages_html, custom_pages_error = build_custom_pages_html(
+            custom_pages, render_data
+        )
+        if custom_pages_error:
+            return None, custom_pages_error
+        render_data["custom_pages_html"] = custom_pages_html
+    return render_data, None
+
+
 def validate_against_csv(
-    spec: MarkdownTableSpec, headers: list[str], rows: list[dict[str, str]]
+    spec: TableSpec, headers: list[str], rows: list[dict[str, str]]
 ) -> None:
     if spec.columns != headers:
         raise ValueError(
@@ -2224,7 +2503,7 @@ async def generate_llm_spec(
     model: str | None,
     base_url: str | None,
     temperature: float | None,
-) -> MarkdownTableSpec:
+) -> TableSpec:
     try:
         from langchain_core.output_parsers import PydanticOutputParser
         from langchain_core.prompts import ChatPromptTemplate
@@ -2238,9 +2517,9 @@ async def generate_llm_spec(
             ),
         ) from exc
 
-    parser = PydanticOutputParser(pydantic_object=MarkdownTableSpec)
+    parser = PydanticOutputParser(pydantic_object=TableSpec)
     system_prompt = (
-        "Voce e um gerador de relatorios em Markdown, mas voce DEVE "
+        "Voce e um gerador de tabelas, mas voce DEVE "
         "responder no formato estruturado solicitado.\n\n"
         "Regras obrigatorias:\n"
         "- NAO invente colunas nem valores.\n"
@@ -2279,7 +2558,7 @@ async def generate_llm_spec(
         temperature=temperature_value,
     )
 
-    def run_chain() -> MarkdownTableSpec:
+    def run_chain() -> TableSpec:
         return (prompt | llm | parser).invoke({"csv_content": csv_text})
 
     try:
@@ -2295,7 +2574,7 @@ async def generate_llm_spec(
     return spec
 
 
-async def generate_llm_markdown_from_csv(
+async def generate_llm_html_from_csv(
     csv_text: str,
     delimiter: str | None,
     has_header: bool,
@@ -2313,7 +2592,7 @@ async def generate_llm_markdown_from_csv(
         csv_text, title_hint, description_hint, model, base_url, temperature
     )
     validate_against_csv(spec, headers, rows)
-    markdown = render_markdown_from_spec(spec, include_header=include_header)
+    table_html = render_html_from_spec(spec, include_header=include_header)
     meta = {
         "columns": headers,
         "row_count": len(rows),
@@ -2322,7 +2601,7 @@ async def generate_llm_markdown_from_csv(
         "sampled": False,
         "truncated": False,
     }
-    return markdown, meta
+    return table_html, meta
 
 
 async def read_upload_file_limited(file: UploadFile, max_bytes: int) -> bytes:
@@ -2342,11 +2621,30 @@ async def read_upload_file_limited(file: UploadFile, max_bytes: int) -> bytes:
     return bytes(content)
 
 
+async def read_upload_file_limited_generic(
+    file: UploadFile, max_bytes: int, label: str
+) -> bytes:
+    content = bytearray()
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        content.extend(chunk)
+        if len(content) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{label} muito grande (max {max_bytes} bytes).",
+            )
+    if not content:
+        raise HTTPException(status_code=400, detail=f"{label} vazio.")
+    return bytes(content)
+
+
 def save_report(
     session: Session,
     template: str,
     data_obj: dict[str, Any],
-    markdown: str,
+    output_html: str,
     template_record: Template | None = None,
 ) -> str | None:
     try:
@@ -2359,7 +2657,7 @@ def save_report(
         template_version=template_record.version if template_record else None,
         template=template,
         data_json=data_json,
-        markdown=markdown,
+        markdown=output_html,
     )
     session.add(report)
     try:
@@ -2371,11 +2669,28 @@ def save_report(
 
 
 def fetch_active_templates(session: Session) -> list[Template]:
-    return session.exec(
-        select(Template)
-        .where(Template.is_active == True)
-        .order_by(Template.key, Template.version.desc())
-    ).all()
+    try:
+        return session.exec(
+            select(Template)
+            .where(Template.is_active == True)
+            .order_by(Template.key, Template.version.desc())
+        ).all()
+    except Exception:
+        return []
+
+
+def fetch_active_templates_safe(timeout_seconds: float = 0.5) -> list[Template]:
+    def run_query() -> list[Template]:
+        with Session(engine) as session:
+            return fetch_active_templates(session)
+
+    try:
+        future = render_executor.submit(run_query)
+        return future.result(timeout=timeout_seconds)
+    except FutureTimeoutError:
+        return []
+    except Exception:
+        return []
 
 
 def render_page_with_templates(session: Session, *args, **kwargs) -> str:
@@ -2402,51 +2717,69 @@ def render_nav(active_tab: str) -> str:
 
 
 def render_template_preview(body: str, limit: int = 240) -> str:
-    if len(body) <= limit:
-        return body
-    return body[:limit].rstrip() + "..."
+    text = strip_html_tags(body)
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
 
 
 def render_report_preview(body: str, limit: int = 260) -> str:
     return render_template_preview(body, limit=limit)
 
 
-def normalize_print_markers(markdown: str) -> str:
-    markers = ["PAGE_BREAK", "COVER_START", "COVER_END", "TOC_START", "TOC_END"]
-    for marker in markers:
-        markdown = re.sub(
-            rf"\[\[{marker}\]\]", f"\n\n[[{marker}]]\n\n", markdown
-        )
-    markdown = re.sub(r"\n{3,}", "\n\n", markdown)
-    return markdown
-
-
-def render_markdown_preview(markdown: str) -> str:
-    markdown = normalize_print_markers(markdown)
-    rendered = markdown_renderer.render(markdown)
-    rendered = re.sub(r'href="javascript:[^"]*"', 'href="#"', rendered, flags=re.IGNORECASE)
-    rendered = re.sub(r'src="javascript:[^"]*"', 'src=""', rendered, flags=re.IGNORECASE)
-    rendered = re.sub(r"<table>", '<div class="table-wrap"><table>', rendered)
-    rendered = re.sub(r"</table>", "</table></div>", rendered)
-    if HOFTALON_TITLE in markdown:
-        match = re.search(r'<img\s+[^>]*src="([^"]+)"', rendered)
-        if match:
-            logo_src = match.group(1)
-            header_html = (
-                f'<div class="print-header"><img src="{logo_src}" alt="Logo"></div>'
-            )
-            rendered = header_html + rendered
-    marker_map = {
-        "PAGE_BREAK": '<div class="page-break" aria-hidden="true"></div>',
-        "COVER_START": '<section class="print-cover">',
-        "COVER_END": "</section>",
-        "TOC_START": '<section class="print-toc">',
-        "TOC_END": "</section>",
-    }
-    for marker, replacement in marker_map.items():
-        pattern = rf"<p>\s*\[\[{marker}\]\]\s*</p>"
-        rendered = re.sub(pattern, replacement, rendered)
+def render_html_preview(html_text: str) -> str:
+    rendered = html_text.strip()
+    rendered = re.sub(
+        r'href="javascript:[^"]*"', 'href="#"', rendered, flags=re.IGNORECASE
+    )
+    rendered = re.sub(
+        r'src="javascript:[^"]*"', 'src=""', rendered, flags=re.IGNORECASE
+    )
     return rendered
+
+
+def render_pdf_page(html_text: str, title: str = "Relatorio", auto_print: bool = True) -> str:
+    output_rendered = render_html_preview(html_text)
+    title_escaped = html.escape(title or "Relatorio")
+    pdf_css = strip_css_imports(BASE_CSS)
+    auto_print_script = ""
+    if auto_print:
+        auto_print_script = (
+            "<script>"
+            "window.addEventListener('load', () => {"
+            "  window.print();"
+            "});"
+            "</script>"
+        )
+    return f"""<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>{title_escaped}</title>
+    <style>
+{pdf_css}
+{PDF_CSS}
+    </style>
+  </head>
+  <body class="abnt-mode pdf-mode">
+    <div class="markdown-preview">{output_rendered}</div>
+    {auto_print_script}
+  </body>
+</html>
+"""
+
+
+def render_pdf_bytes(html_text: str, base_url: str, title: str) -> bytes:
+    if HTML is None:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "PDF server-side indisponivel. Instale WeasyPrint: "
+                "pip install weasyprint (requer dependencias do sistema)."
+            ),
+        )
+    html = render_pdf_page(html_text, title=title, auto_print=False)
+    return HTML(string=html, base_url=base_url).write_pdf()
 
 
 def render_page(
@@ -2473,24 +2806,30 @@ def render_page(
     notice_html = f'<div class="notice">{html.escape(notice)}</div>' if notice else ""
     output_html = ""
     if output:
-        output_rendered = render_markdown_preview(output)
+        output_rendered = render_html_preview(output)
         output_html = f"""
       <section class="card output-card">
         <div class="card-header">
           <h2>Saida</h2>
-          <span class="badge accent">Markdown</span>
-          <button type="button" class="btn ghost copy-btn" data-copy-target="#markdown-raw">
+          <span class="badge accent">HTML</span>
+          <button type="button" class="btn ghost copy-btn" data-copy-target="#html-raw">
             Copiar
           </button>
-          <button type="button" class="btn ghost print-btn" data-print-target="#markdown-preview">
+          <button type="button" class="btn ghost" id="html-preview-pdf-btn">
+            Preview PDF
+          </button>
+          <button type="button" class="btn ghost print-btn" data-print-target="#html-preview">
             Imprimir/PDF
           </button>
           <span class="copy-status" id="copy-status" aria-live="polite"></span>
         </div>
-        <div class="markdown-preview" id="markdown-preview">{output_rendered}</div>
+        <div class="preview-frame">
+          <div class="markdown-preview pdf-preview" id="html-preview">{output_rendered}</div>
+          <iframe class="pdf-iframe" id="html-preview-pdf" title="Preview PDF"></iframe>
+        </div>
         <details class="raw-output">
-          <summary>Ver Markdown bruto</summary>
-          <pre class="code-block" id="markdown-raw">{output_escaped}</pre>
+          <summary>Ver HTML bruto</summary>
+          <pre class="code-block" id="html-raw">{output_escaped}</pre>
         </details>
       </section>
 """
@@ -2508,13 +2847,6 @@ def render_page(
             '<p class="summary">Template ligado ao banco. '
             'Use "Atualizar template" para aplicar mudancas.</p>'
         )
-    tutorial_placeholder = html.escape(TUTORIAL_PLACEHOLDER)
-    tutorial_json_inline = html.escape(TUTORIAL_JSON_INLINE)
-    tutorial_template_example = html.escape(TUTORIAL_TEMPLATE_EXAMPLE)
-    tutorial_json_example = html.escape(TUTORIAL_JSON_EXAMPLE)
-    tutorial_schema_hint = html.escape(TUTORIAL_SCHEMA_HINT)
-    csv_example_text = html.escape(CSV_EXAMPLE_TEXT)
-    csv_example_template = html.escape(CSV_EXAMPLE_TEMPLATE)
     flow_template_example = html.escape(FLOW_TEMPLATE_EXAMPLE)
     flow_data_example = html.escape(FLOW_DATA_EXAMPLE)
     flow_table_csv_example = html.escape(FLOW_TABLE_CSV_EXAMPLE)
@@ -2539,17 +2871,50 @@ def render_page(
         str(template.id): {
             "key": template.key,
             "version": template.version,
-            "body": template.body,
         }
         for template in templates_list
     }
     templates_json = json.dumps(templates_payload, ensure_ascii=True).replace("<", "\\u003c")
+    flow_example_payload = {
+        "template": FLOW_TEMPLATE_EXAMPLE,
+        "data": FLOW_DATA_EXAMPLE,
+        "report_style": "hoftalon",
+        "tables": [
+            {
+                "key": "resultados_1",
+                "csv": FLOW_TABLE_CSV_EXAMPLE,
+                "delimiter": ",",
+                "has_header": True,
+                "title": "Tabela de resultados 1",
+                "description": "",
+            },
+            {
+                "key": "resultados_2",
+                "csv": FLOW_TABLE_CSV_EXAMPLE_2,
+                "delimiter": ",",
+                "has_header": True,
+                "title": "Tabela de resultados 2",
+                "description": "",
+            },
+            {
+                "key": "atividades",
+                "csv": FLOW_TABLE_CSV_EXAMPLE_ACTIVIDADES,
+                "delimiter": ",",
+                "has_header": True,
+                "title": "Tabela de atividades",
+                "description": "",
+            },
+        ],
+    }
+    flow_example_json = json.dumps(flow_example_payload, ensure_ascii=True).replace(
+        "<", "\\u003c"
+    )
 
     return f"""<!doctype html>
 <html>
   <head>
     <meta charset="utf-8">
-    <title>Gerador de Markdown</title>
+    <title>Gerador de Relatorios</title>
     <style>
 {BASE_CSS}
     </style>
@@ -2560,23 +2925,8 @@ def render_page(
       <header class="hero">
         <div>
           <p class="eyebrow">MVP</p>
-          <h1>Gerador de Markdown</h1>
-          <p class="lead">Escreva um template Jinja2 e dados JSON, depois gere o Markdown.</p>
-        </div>
-        <div class="hero-card">
-          <p>Limites atuais</p>
-          <ul>
-            <li>Template: {MAX_TEMPLATE_CHARS} chars</li>
-            <li>JSON: {MAX_DATA_CHARS} chars</li>
-            <li>Saida: {MAX_OUTPUT_CHARS} chars</li>
-            <li>Render: {MAX_RENDER_SECONDS}s</li>
-          </ul>
-          <div class="abnt-toggle">
-            <button type="button" class="btn ghost small" id="abnt-toggle" aria-pressed="false">
-              Modo ABNT: desligado
-            </button>
-            <p class="summary">Aplica formatacao ABNT no preview.</p>
-          </div>
+          <h1>Gerador de Relatorios</h1>
+          <p class="lead">Escreva um template Jinja2 e dados JSON, depois gere o HTML.</p>
         </div>
       </header>
       <section class="layout">
@@ -2626,7 +2976,15 @@ def render_page(
               </div>
               <div class="buttons">
                 <button type="submit" class="btn primary">Gerar</button>
-                <button type="submit" class="btn secondary" formaction="/download">Baixar</button>
+                <button
+                  type="submit"
+                  class="btn secondary"
+                  formaction="/download/pdf"
+                  formtarget="_blank"
+                >
+                  Baixar PDF
+                </button>
+                <button type="submit" class="btn ghost" formaction="/download">Baixar HTML</button>
                 <button type="submit" class="btn ghost" formaction="/templates/save">Salvar template</button>
                 {update_button_html}
               </div>
@@ -2640,11 +2998,31 @@ def render_page(
               <div class="field">
                 <label for="flow_template">Template</label>
                 <textarea id="flow_template" name="flow_template">{flow_template_example}</textarea>
-                <p class="summary">Use <code>{{ tables_md["chave"] }}</code> para inserir a tabela.</p>
+                <p class="summary">Use <code>{{ tables_html["chave"] }}</code> para inserir a tabela.</p>
               </div>
             <div class="field">
               <label for="flow_data">Dados (JSON)</label>
               <textarea id="flow_data" name="flow_data">{flow_data_example}</textarea>
+              <p class="summary">Opcional: use <code>custom_pages</code> para inserir paginas completas (layout: cover, page ou toc).</p>
+              <p class="summary">Logo privado: por padrao salva em <code>assets/logo.png</code> e usa <code>/private/logo</code> sem token. Se quiser, configure <code>PRIVATE_LOGO_PATH</code> ou ative <code>PRIVATE_LOGO_REQUIRE_TOKEN=1</code> com <code>PRIVATE_LOGO_TOKEN</code>.</p>
+            </div>
+            <div class="field">
+              <label>Configuracao da capa</label>
+              <div class="filters">
+                <div class="field">
+                  <label for="flow_logo_token">Token do logo</label>
+                  <input id="flow_logo_token" type="text" placeholder="token (opcional se desativado)">
+                </div>
+                <div class="field">
+                  <label for="flow_logo_file">Arquivo do logo</label>
+                  <input id="flow_logo_file" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml">
+                </div>
+                <div class="field">
+                  <label>&nbsp;</label>
+                  <button type="button" class="btn ghost" id="flow_logo_upload">Enviar logo</button>
+                </div>
+              </div>
+              <p class="summary" id="flow_logo_status"></p>
             </div>
             <div class="field">
               <label for="flow_style">Estilo</label>
@@ -2652,7 +3030,7 @@ def render_page(
                 <option value="default">Padrao</option>
                 <option value="hoftalon" selected>Hoftalon</option>
               </select>
-              <p class="summary">Hoftalon aplica estrutura fixa e validacoes.</p>
+              <p class="summary">Hoftalon aplica estilo ABNT e paginação, com estrutura livre.</p>
             </div>
             <div class="field">
               <label>Parametros do LLM</label>
@@ -2835,18 +3213,22 @@ def render_page(
               </div>
             </template>
             <div class="buttons">
+              <button type="button" class="btn ghost" id="flow-load-example">Carregar exemplo</button>
               <button type="button" class="btn ghost" id="flow-add-table">Adicionar tabela</button>
-              <button type="submit" class="btn primary">Gerar e baixar</button>
+              <button type="submit" class="btn primary">Gerar</button>
             </div>
             <div class="flow-results">
               <div class="field">
-                <label for="flow-output">Markdown gerado</label>
+                <label for="flow-output">HTML gerado</label>
                 <pre class="code-block" id="flow-output"></pre>
               </div>
               <div class="field">
                 <label for="flow-preview">Preview renderizado</label>
-                <div class="markdown-preview preview-empty" id="flow-preview">
-                  Preview aparecera aqui.
+                <div class="preview-frame">
+                  <div class="markdown-preview pdf-preview preview-empty" id="flow-preview">
+                    Preview aparecera aqui.
+                  </div>
+                  <iframe class="pdf-iframe" id="flow-preview-pdf" title="Preview PDF"></iframe>
                 </div>
                 <div class="buttons">
                   <button
@@ -2856,110 +3238,22 @@ def render_page(
                   >
                     Imprimir/PDF
                   </button>
+                  <button type="button" class="btn ghost small" id="flow-preview-pdf-btn">
+                    Preview PDF
+                  </button>
+                  <button type="button" class="btn ghost small" id="flow-pdf">
+                    Baixar PDF
+                  </button>
                 </div>
               </div>
             </div>
           </form>
         </section>
       </section>
-      <aside class="side-column">
-        <section class="card">
-          <h2>Tutorial rapido</h2>
-          <ol class="steps">
-            <li>Edite o template usando placeholders do Jinja2 como <code>{tutorial_placeholder}</code>.</li>
-            <li>Cole os dados JSON com as mesmas chaves, por exemplo <code>{tutorial_json_inline}</code>.</li>
-            <li>Clique em <strong>Gerar</strong> para ver a saida ou em <strong>Baixar</strong> para baixar o arquivo.</li>
-          </ol>
-          <p class="hint">{tutorial_schema_hint}</p>
-          <p>Exemplo de template:</p>
-          <pre class="code-block">{tutorial_template_example}</pre>
-          <p>Exemplo de JSON:</p>
-          <pre class="code-block">{tutorial_json_example}</pre>
-        </section>
-        <section class="card">
-          <h2>CSV para Markdown</h2>
-          <p class="summary">Envie um CSV, defina um template e baixe o Markdown.</p>
-          <form method="post" action="/api/csv/extract" enctype="multipart/form-data" class="stack">
-            <div class="field">
-              <label for="csv_file">Arquivo CSV</label>
-              <input id="csv_file" name="file" type="file" accept=".csv,text/csv">
-              <p class="summary">Se nao enviar, usa o exemplo abaixo.</p>
-            </div>
-            <div class="field">
-              <label for="csv_delimiter">Delimitador</label>
-              <input id="csv_delimiter" name="delimiter" type="text" placeholder="; , | ou tab">
-            </div>
-            <div class="field">
-              <label for="csv_header">Cabecalho</label>
-              <select id="csv_header" name="has_header">
-                <option value="true" selected>Sim</option>
-                <option value="false">Nao</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="csv_limit">Limite de linhas</label>
-              <input id="csv_limit" name="limit" type="number" min="1" placeholder="200">
-            </div>
-            <div class="field">
-              <label for="csv_template">Template CSV</label>
-              <textarea id="csv_template" name="template">{csv_example_template}</textarea>
-            </div>
-            <div class="buttons">
-              <button type="submit" class="btn primary">Exportar Markdown</button>
-            </div>
-          </form>
-          <p class="summary">CSV de exemplo:</p>
-          <pre class="code-block">{csv_example_text}</pre>
-        </section>
-        <section class="card">
-          <h2>CSV com LLM</h2>
-          <p class="summary">Gere o Markdown usando o modelo LLM e baixe o arquivo.</p>
-          <form method="post" action="/api/csv/llm" enctype="multipart/form-data" class="stack">
-            <div class="field">
-              <label for="llm_csv_file">Arquivo CSV</label>
-              <input id="llm_csv_file" name="file" type="file" accept=".csv,text/csv" required>
-            </div>
-            <div class="field">
-              <label for="llm_delimiter">Delimitador</label>
-              <input id="llm_delimiter" name="delimiter" type="text" placeholder="; , | ou tab">
-            </div>
-            <div class="field">
-              <label for="llm_header">Cabecalho</label>
-              <select id="llm_header" name="has_header">
-                <option value="true" selected>Sim</option>
-                <option value="false">Nao</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="llm_title">Titulo</label>
-              <input id="llm_title" name="title" type="text" placeholder="Relatorio CSV">
-            </div>
-            <div class="field">
-              <label for="llm_description">Descricao</label>
-              <textarea id="llm_description" name="description" placeholder="Resumo curto da tabela."></textarea>
-            </div>
-            <div class="field">
-              <label for="llm_model">Modelo</label>
-              <input id="llm_model" name="model" type="text" placeholder="{llm_default_model}">
-            </div>
-            <div class="field">
-              <label for="llm_base_url">Base URL</label>
-              <input id="llm_base_url" name="base_url" type="text" placeholder="{llm_default_base_url}">
-            </div>
-            <div class="field">
-              <label for="llm_temperature">Temperatura</label>
-              <input id="llm_temperature" name="temperature" type="number" step="0.1" min="0" placeholder="0">
-            </div>
-            <div class="buttons">
-              <button type="submit" class="btn primary">Exportar Markdown (LLM)</button>
-            </div>
-          </form>
-          <p class="summary">Requer LLM acessivel e dependencias instaladas.</p>
-        </section>
-      </aside>
     </section>
     </main>
     <script type="application/json" id="template-data">{templates_json}</script>
+    <script type="application/json" id="flow-example-data">{flow_example_json}</script>
     <script>
       (() => {{
         const copyBtn = document.querySelector(".copy-btn");
@@ -2993,19 +3287,6 @@ def render_page(
           }});
         }}
 
-        const abntToggle = document.getElementById("abnt-toggle");
-        if (abntToggle) {{
-          const setAbntState = (active) => {{
-            abntToggle.setAttribute("aria-pressed", active ? "true" : "false");
-            abntToggle.textContent = active ? "Modo ABNT: ligado" : "Modo ABNT: desligado";
-          }};
-          setAbntState(document.body.classList.contains("abnt-mode"));
-          abntToggle.addEventListener("click", () => {{
-            const active = document.body.classList.toggle("abnt-mode");
-            setAbntState(active);
-          }});
-        }}
-
         const printButtons = document.querySelectorAll(".print-btn");
         if (printButtons.length) {{
           const clearPrintTargets = () => {{
@@ -3026,6 +3307,39 @@ def render_page(
           }});
         }}
 
+        const loadPdfPreview = async (htmlContent, iframeId, htmlId) => {{
+          const iframe = document.getElementById(iframeId);
+          if (!iframe) return;
+          if (!htmlContent || !htmlContent.trim()) return;
+          const htmlPreview = htmlId ? document.getElementById(htmlId) : null;
+          try {{
+            const response = await fetch("/api/pdf", {{
+              method: "POST",
+              headers: {{
+                "Content-Type": "application/json",
+              }},
+              body: JSON.stringify({{
+                html: htmlContent,
+                title: "Relatorio",
+              }}),
+            }});
+            if (!response.ok) return;
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            if (iframe.dataset.previewUrl) {{
+              URL.revokeObjectURL(iframe.dataset.previewUrl);
+            }}
+            iframe.dataset.previewUrl = url;
+            iframe.src = url;
+            iframe.style.display = "block";
+            if (htmlPreview) {{
+              htmlPreview.style.display = "none";
+            }}
+          }} catch (err) {{
+            // fallback to HTML preview if PDF fails
+          }}
+        }};
+
         const templateSelect = document.getElementById("template_select");
         const templateIdInput = document.getElementById("template_id");
         const templateKeyInput = document.getElementById("template_key");
@@ -3043,7 +3357,7 @@ def render_page(
           }}
         }}
 
-        const applyTemplate = (templateId) => {{
+        const applyTemplate = async (templateId) => {{
           const selected = templateData[templateId];
           if (!selected) {{
             return;
@@ -3059,8 +3373,20 @@ def render_page(
           if (templateVersionInput) {{
             templateVersionInput.value = selected.version || "";
           }}
-          if (templateBodyInput) {{
+          if (templateBodyInput && selected.body) {{
             templateBodyInput.value = selected.body || "";
+            return;
+          }}
+          if (!templateBodyInput) return;
+          try {{
+            const response = await fetch(`/api/templates/${{templateId}}`);
+            if (!response.ok) return;
+            const body = await response.json();
+            const templateBody = body.body || "";
+            activeTemplateBody = templateBody;
+            templateBodyInput.value = templateBody;
+          }} catch (err) {{
+            // ignore
           }}
         }};
 
@@ -3099,15 +3425,41 @@ def render_page(
           }});
         }}
 
+        const rawHtml = document.getElementById("html-raw");
+        const htmlPreviewBtn = document.getElementById("html-preview-pdf-btn");
+        if (rawHtml && htmlPreviewBtn) {{
+          htmlPreviewBtn.addEventListener("click", () => {{
+            loadPdfPreview(rawHtml.textContent || "", "html-preview-pdf", "html-preview");
+          }});
+        }}
+
         const flowForm = document.getElementById("flow-form");
         if (flowForm) {{
           const tableList = document.getElementById("flow-table-list");
           const addTableBtn = document.getElementById("flow-add-table");
+          const exampleBtn = document.getElementById("flow-load-example");
           const templateEl = document.getElementById("flow-table-template");
           const errorEl = document.getElementById("flow-error");
           const outputEl = document.getElementById("flow-output");
+          const pdfBtn = document.getElementById("flow-pdf");
+          const previewPdfBtn = document.getElementById("flow-preview-pdf-btn");
+          const dataInput = document.getElementById("flow_data");
+          const exampleDataEl = document.getElementById("flow-example-data");
+          const logoTokenInput = document.getElementById("flow_logo_token");
+          const logoFileInput = document.getElementById("flow_logo_file");
+          const logoUploadBtn = document.getElementById("flow_logo_upload");
+          const logoStatusEl = document.getElementById("flow_logo_status");
           const maxTables = parseInt(flowForm.dataset.maxTables || "0", 10) || 0;
           let tableCounter = tableList ? tableList.children.length : 0;
+          let lastFlowHtml = "";
+          let flowExampleData = null;
+          if (exampleDataEl && exampleDataEl.textContent) {{
+            try {{
+              flowExampleData = JSON.parse(exampleDataEl.textContent);
+            }} catch (err) {{
+              flowExampleData = null;
+            }}
+          }}
 
           const showError = (message) => {{
             if (!errorEl) return;
@@ -3118,6 +3470,63 @@ def render_page(
             }}
             errorEl.style.display = "block";
             errorEl.textContent = message;
+          }};
+
+          const setLogoStatus = (message) => {{
+            if (!logoStatusEl) return;
+            logoStatusEl.textContent = message || "";
+          }};
+
+          const openPdfPreview = async () => {{
+            if (!lastFlowHtml) {{
+              showError("Gere o relatorio antes de baixar o PDF.");
+              return;
+            }}
+            try {{
+              const response = await fetch("/api/pdf", {{
+                method: "POST",
+                headers: {{
+                  "Content-Type": "application/json",
+                }},
+                body: JSON.stringify({{
+                  html: lastFlowHtml,
+                  title: "Relatorio",
+                }}),
+              }});
+              if (!response.ok) {{
+                const body = await response.json().catch(() => ({{}}));
+                showError(body.detail || "Falha ao gerar PDF.");
+                return;
+              }}
+              const blob = await response.blob();
+              const url = URL.createObjectURL(blob);
+              const link = document.createElement("a");
+              link.href = url;
+              link.download = "relatorio.pdf";
+              document.body.appendChild(link);
+              link.click();
+              link.remove();
+              URL.revokeObjectURL(url);
+            }} catch (err) {{
+              showError("Falha ao gerar PDF.");
+            }}
+          }};
+
+          const updateLogoUrlInJson = (logoUrl) => {{
+            if (!dataInput) return false;
+            const raw = dataInput.value.trim();
+            let obj = {{}};
+            if (raw) {{
+              try {{
+                obj = JSON.parse(raw);
+              }} catch (err) {{
+                showError("JSON invalido nos dados do relatorio.");
+                return false;
+              }}
+            }}
+            obj.logo_url = logoUrl;
+            dataInput.value = JSON.stringify(obj, null, 2);
+            return true;
           }};
 
           const buildTablePayload = () => {{
@@ -3168,12 +3577,65 @@ def render_page(
             const item = wrapper.firstElementChild;
             if (!item) return;
             tableList.appendChild(item);
+            return item;
+          }};
+
+          const applyExample = () => {{
+            if (!flowExampleData) return;
+            const templateInput = document.getElementById("flow_template");
+            const styleInput = document.getElementById("flow_style");
+            if (templateInput) {{
+              templateInput.value = flowExampleData.template || "";
+            }}
+            if (dataInput) {{
+              dataInput.value = flowExampleData.data || "";
+            }}
+            if (styleInput) {{
+              styleInput.value = flowExampleData.report_style || "hoftalon";
+            }}
+            if (tableList) {{
+              tableList.innerHTML = "";
+              tableCounter = 0;
+              const tables = Array.isArray(flowExampleData.tables) ? flowExampleData.tables : [];
+              tables.forEach((table) => {{
+                const item = addTableItem();
+                if (!item) return;
+                const setValue = (selector, value) => {{
+                  const el = item.querySelector(selector);
+                  if (el) {{
+                    el.value = value ?? "";
+                  }}
+                }};
+                setValue(".table-key", table.key || "");
+                setValue(".table-csv", table.csv || "");
+                setValue(".table-delimiter", table.delimiter || "");
+                const headerValue = table.has_header === false ? "false" : "true";
+                const headerEl = item.querySelector(".table-header");
+                if (headerEl) {{
+                  headerEl.value = headerValue;
+                }}
+                setValue(".table-title", table.title || "");
+                setValue(".table-description", table.description || "");
+              }});
+            }}
+            if (outputEl) outputEl.textContent = "";
+            const previewEl = document.getElementById("flow-preview");
+            if (previewEl) {{
+              previewEl.classList.add("preview-empty");
+              previewEl.textContent = "Preview aparecera aqui.";
+            }}
           }};
 
           if (addTableBtn) {{
             addTableBtn.addEventListener("click", () => {{
               showError("");
               addTableItem();
+            }});
+          }}
+          if (exampleBtn) {{
+            exampleBtn.addEventListener("click", () => {{
+              showError("");
+              applyExample();
             }});
           }}
 
@@ -3215,13 +3677,62 @@ def render_page(
             }});
           }}
 
+          if (logoUploadBtn) {{
+            logoUploadBtn.addEventListener("click", async () => {{
+              showError("");
+              setLogoStatus("");
+              const token = logoTokenInput ? logoTokenInput.value.trim() : "";
+              if (!logoFileInput || !logoFileInput.files || !logoFileInput.files[0]) {{
+                showError("Selecione um arquivo de logo.");
+                return;
+              }}
+              const file = logoFileInput.files[0];
+              const formData = new FormData();
+              formData.append("file", file);
+              try {{
+                const query = token ? `?token=${{encodeURIComponent(token)}}` : "";
+                const response = await fetch(`/private/logo/upload${{query}}`, {{
+                  method: "POST",
+                  body: formData,
+                }});
+                const body = await response.json();
+                if (!response.ok) {{
+                  showError(body.detail || "Falha ao enviar logo.");
+                  return;
+                }}
+                const logoUrl = body.logo_url || (token ? `/private/logo?token=${{token}}` : "/private/logo");
+                if (updateLogoUrlInJson(logoUrl)) {{
+                  setLogoStatus("Logo enviado e aplicado.");
+                }}
+              }} catch (err) {{
+                showError("Falha ao enviar logo.");
+              }}
+            }});
+          }}
+
+          if (pdfBtn) {{
+            pdfBtn.addEventListener("click", () => {{
+              showError("");
+              openPdfPreview();
+            }});
+          }}
+          if (previewPdfBtn) {{
+            previewPdfBtn.addEventListener("click", () => {{
+              showError("");
+              if (!lastFlowHtml) {{
+                showError("Gere o relatorio antes do preview.");
+                return;
+              }}
+              loadPdfPreview(lastFlowHtml, "flow-preview-pdf", "flow-preview");
+            }});
+          }}
+
           flowForm.addEventListener("submit", async (event) => {{
             event.preventDefault();
             showError("");
             if (outputEl) outputEl.textContent = "";
 
             const templateInput = document.getElementById("flow_template");
-            const dataInput = document.getElementById("flow_data");
             const styleInput = document.getElementById("flow_style");
             const modelInput = document.getElementById("flow_model");
             const baseUrlInput = document.getElementById("flow_base_url");
@@ -3274,33 +3785,24 @@ def render_page(
                 showError(body.detail || "Erro ao gerar relatorio.");
                 return;
               }}
-              const markdown = body.markdown || "";
+              const htmlOutput = body.html || "";
+              lastFlowHtml = htmlOutput;
               if (outputEl) {{
-                outputEl.textContent = markdown;
+                outputEl.textContent = htmlOutput;
               }}
               const previewEl = document.getElementById("flow-preview");
               if (previewEl) {{
                 previewEl.classList.add("preview-empty");
                 previewEl.textContent = "Carregando preview...";
               }}
-              const blob = new Blob([markdown], {{ type: "text/markdown" }});
-              const url = URL.createObjectURL(blob);
-              const link = document.createElement("a");
-              link.href = url;
-              link.download = "relatorio_llm.md";
-              document.body.appendChild(link);
-              link.click();
-              link.remove();
-              URL.revokeObjectURL(url);
-
               if (previewEl) {{
                 try {{
-                  const previewResponse = await fetch("/api/markdown/preview", {{
+                  const previewResponse = await fetch("/api/html/preview", {{
                     method: "POST",
                     headers: {{
                       "Content-Type": "application/json",
                     }},
-                    body: JSON.stringify({{ markdown }}),
+                    body: JSON.stringify({{ html: htmlOutput }}),
                   }});
                   const previewBody = await previewResponse.json();
                   if (previewResponse.ok && previewBody.html !== undefined) {{
@@ -3313,6 +3815,7 @@ def render_page(
                   previewEl.textContent = "Falha ao renderizar o preview.";
                 }}
               }}
+              // Preview PDF apenas sob demanda.
             }} catch (err) {{
               showError("Falha ao chamar o endpoint.");
             }}
@@ -3453,13 +3956,6 @@ def render_templates_page(
           <h1>Templates</h1>
           <p class="lead">Lista de templates salvos no banco.</p>
         </div>
-        <div class="hero-card">
-          <p>Dicas rapidas</p>
-          <ul>
-            <li>Use "Abrir" para carregar no gerador</li>
-            <li>Desative para organizar a lista</li>
-          </ul>
-        </div>
       </header>
       {filters_html}
       <section class="template-grid">
@@ -3538,7 +4034,7 @@ def render_reports_page(
             preview = html.escape(render_report_preview(report.markdown))
             template_size = len(report.template)
             data_size = len(report.data_json)
-            markdown_size = len(report.markdown)
+            html_size = len(report.markdown)
             template_ref = ""
             if report.template_key and report.template_version is not None:
                 template_ref = (
@@ -3554,11 +4050,12 @@ def render_reports_page(
               <p class="template-title">Relatorio #{report.id}</p>
               <div class="template-meta">Criado {created_at}</div>
               {template_ref}
-              <div class="template-meta">T {template_size} - J {data_size} - M {markdown_size}</div>
+              <div class="template-meta">T {template_size} - J {data_size} - H {html_size}</div>
             </div>
             <div class="actions">
               <a class="btn secondary" href="/reports/{report.id}">Abrir</a>
-              <a class="btn ghost" href="/reports/{report.id}/download">Baixar</a>
+              <a class="btn primary" href="/reports/{report.id}/pdf" target="_blank">PDF</a>
+              <a class="btn ghost" href="/reports/{report.id}/download">HTML</a>
             </div>
           </div>
           <pre class="code-block">{preview}</pre>
@@ -3597,13 +4094,6 @@ def render_reports_page(
           <h1>Relatorios</h1>
           <p class="lead">Relatorios gerados e salvos no banco.</p>
         </div>
-        <div class="hero-card">
-          <p>Atalhos</p>
-          <ul>
-            <li>Use a busca para localizar saidas antigas</li>
-            <li>Abra para editar e gerar de novo</li>
-          </ul>
-        </div>
       </header>
       {filters_html}
       <section class="template-grid">
@@ -3616,9 +4106,16 @@ def render_reports_page(
 """
 
 
+def _init_db_background() -> None:
+    try:
+        init_db()
+    except Exception:
+        pass
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    init_db()
+    threading.Thread(target=_init_db_background, daemon=True).start()
     yield
 
 
@@ -3630,8 +4127,9 @@ app = FastAPI(
 
 
 @app.get("/", response_class=HTMLResponse)
-def read_root(session: Session = Depends(get_session)) -> str:
-    return render_page_with_templates(session, DEFAULT_TEMPLATE, DEFAULT_DATA)
+def read_root() -> str:
+    templates = fetch_active_templates_safe()
+    return render_page(DEFAULT_TEMPLATE, DEFAULT_DATA, templates=templates)
 
 
 @app.get("/templates", response_class=HTMLResponse)
@@ -3785,12 +4283,32 @@ def download_report(
     report = session.get(Report, report_id)
     if not report:
         raise HTTPException(status_code=404, detail="Relatorio nao encontrado.")
-    filename = f"relatorio_{report.id}.md"
+    filename = f"relatorio_{report.id}.html"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return Response(
         content=report.markdown,
-        media_type="text/markdown; charset=utf-8",
+        media_type="text/html; charset=utf-8",
         headers=headers,
+    )
+
+
+@app.get("/reports/{report_id}/pdf")
+def download_report_pdf(
+    report_id: int,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> Response:
+    report = session.get(Report, report_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="Relatorio nao encontrado.")
+    title = f"Relatorio {report.id}"
+    pdf_bytes = render_pdf_bytes(
+        report.markdown, base_url=str(request.base_url), title=title
+    )
+    filename = f"relatorio_{report.id}.pdf"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(
+        content=pdf_bytes, media_type="application/pdf", headers=headers
     )
 
 
@@ -3813,6 +4331,23 @@ def open_template(
             template_id=str(template.id),
         )
     )
+
+
+@app.get("/api/templates/{template_id}")
+def get_template_json(
+    template_id: int, session: Session = Depends(get_session)
+) -> dict[str, Any]:
+    template = session.get(Template, template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template nao encontrado.")
+    if not template.is_active:
+        raise HTTPException(status_code=400, detail="Template desativado.")
+    return {
+        "id": template.id,
+        "key": template.key,
+        "version": template.version,
+        "body": template.body,
+    }
 
 
 @app.post("/templates/{template_id}/deactivate")
@@ -4018,7 +4553,24 @@ def generate(
             status_code=400,
         )
 
-    markdown, render_error = render_markdown_safe(template_text or template, data_obj)
+    render_data, custom_error = prepare_custom_pages_data(data_obj)
+    if custom_error:
+        return HTMLResponse(
+            render_page_with_templates(
+                session,
+                template_text or template,
+                data,
+                error=custom_error,
+                template_key=template_key,
+                template_version=template_version,
+                template_id=template_id,
+            ),
+            status_code=400,
+        )
+
+    output_html, render_error = render_html_safe(
+        template_text or template, render_data or data_obj
+    )
     if render_error:
         return HTMLResponse(
             render_page_with_templates(
@@ -4034,7 +4586,7 @@ def generate(
         )
 
     save_error = save_report(
-        session, template_text or template, data_obj, markdown, template_record
+        session, template_text or template, data_obj, output_html, template_record
     )
     notice = None
     if save_error:
@@ -4045,7 +4597,7 @@ def generate(
             session,
             template_text or template,
             data,
-            output=markdown,
+            output=output_html,
             notice=notice,
             template_key=template_key,
             template_version=template_version,
@@ -4095,7 +4647,24 @@ def download(
             status_code=400,
         )
 
-    markdown, render_error = render_markdown_safe(template_text or template, data_obj)
+    render_data, custom_error = prepare_custom_pages_data(data_obj)
+    if custom_error:
+        return HTMLResponse(
+            render_page_with_templates(
+                session,
+                template_text or template,
+                data,
+                error=custom_error,
+                template_key=template_key,
+                template_version=template_version,
+                template_id=template_id,
+            ),
+            status_code=400,
+        )
+
+    output_html, render_error = render_html_safe(
+        template_text or template, render_data or data_obj
+    )
     if render_error:
         return HTMLResponse(
             render_page_with_templates(
@@ -4111,13 +4680,100 @@ def download(
         )
 
     save_report(
-        session, template_text or template, data_obj, markdown, template_record
+        session, template_text or template, data_obj, output_html, template_record
     )
-    headers = {"Content-Disposition": 'attachment; filename="relatorio.md"'}
+    headers = {"Content-Disposition": 'attachment; filename="relatorio.html"'}
     return Response(
-        content=markdown,
-        media_type="text/markdown; charset=utf-8",
+        content=output_html,
+        media_type="text/html; charset=utf-8",
         headers=headers,
+    )
+
+
+@app.post("/download/pdf")
+def download_pdf(
+    request: Request,
+    template: str = Form(...),
+    data: str = Form("{}"),
+    template_key: str = Form(""),
+    template_version: str = Form(""),
+    template_id: str = Form(""),
+    session: Session = Depends(get_session),
+) -> Response:
+    template_text, template_record, template_error = resolve_template_for_form(
+        session, template, template_id
+    )
+    if template_error:
+        return HTMLResponse(
+            render_page_with_templates(
+                session,
+                template,
+                data,
+                error=template_error,
+                template_key=template_key,
+                template_version=template_version,
+                template_id=template_id,
+            ),
+            status_code=400,
+        )
+
+    data_obj, error = parse_form_data(data)
+    if error:
+        return HTMLResponse(
+            render_page_with_templates(
+                session,
+                template_text or template,
+                data,
+                error=error,
+                template_key=template_key,
+                template_version=template_version,
+                template_id=template_id,
+            ),
+            status_code=400,
+        )
+
+    render_data, custom_error = prepare_custom_pages_data(data_obj)
+    if custom_error:
+        return HTMLResponse(
+            render_page_with_templates(
+                session,
+                template_text or template,
+                data,
+                error=custom_error,
+                template_key=template_key,
+                template_version=template_version,
+                template_id=template_id,
+            ),
+            status_code=400,
+        )
+
+    output_html, render_error = render_html_safe(
+        template_text or template, render_data or data_obj
+    )
+    if render_error:
+        return HTMLResponse(
+            render_page_with_templates(
+                session,
+                template_text or template,
+                data,
+                error=render_error,
+                template_key=template_key,
+                template_version=template_version,
+                template_id=template_id,
+            ),
+            status_code=400,
+        )
+
+    save_report(
+        session, template_text or template, data_obj, output_html, template_record
+    )
+    title = template_key or "Relatorio"
+    pdf_bytes = render_pdf_bytes(
+        output_html, base_url=str(request.base_url), title=title
+    )
+    headers = {"Content-Disposition": 'attachment; filename="relatorio.pdf"'}
+    return Response(
+        content=pdf_bytes, media_type="application/pdf", headers=headers
     )
 
 
@@ -4250,23 +4906,132 @@ def render_api(
     if data_error:
         raise HTTPException(status_code=400, detail=data_error)
 
-    markdown, render_error = render_markdown_safe(template_text or "", validated_data)
+    render_data, custom_error = prepare_custom_pages_data(validated_data)
+    if custom_error:
+        raise HTTPException(status_code=400, detail=custom_error)
+
+    output_html, render_error = render_html_safe(
+        template_text or "", render_data or validated_data
+    )
     if render_error:
         raise HTTPException(status_code=400, detail=render_error)
 
-    save_report(session, template_text or "", validated_data, markdown, template_record)
-    return {"markdown": markdown}
+    save_report(session, template_text or "", validated_data, output_html, template_record)
+    return {"html": output_html}
 
 
-@app.post("/api/markdown/preview")
-def markdown_preview(payload: MarkdownPreviewRequest) -> dict[str, str]:
-    markdown = payload.markdown or ""
-    if len(markdown) > MAX_OUTPUT_CHARS:
+@app.post("/api/html/preview")
+def html_preview(payload: HtmlPreviewRequest) -> dict[str, str]:
+    output_html = payload.html or ""
+    if len(output_html) > MAX_OUTPUT_CHARS:
         raise HTTPException(
             status_code=400,
-            detail=f"Markdown muito longo (max {MAX_OUTPUT_CHARS} caracteres).",
+            detail=f"HTML muito longo (max {MAX_OUTPUT_CHARS} caracteres).",
         )
-    return {"html": render_markdown_preview(markdown)}
+    return {"html": render_html_preview(output_html)}
+
+
+@app.post("/api/pdf")
+def html_pdf(payload: HtmlPdfRequest, request: Request) -> Response:
+    output_html = payload.html or ""
+    if len(output_html) > MAX_OUTPUT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"HTML muito longo (max {MAX_OUTPUT_CHARS} caracteres).",
+        )
+    title = payload.title or "Relatorio"
+    pdf_bytes = render_pdf_bytes(
+        output_html, base_url=str(request.base_url), title=title
+    )
+    headers = {"Content-Disposition": 'attachment; filename="relatorio.pdf"'}
+    return Response(
+        content=pdf_bytes, media_type="application/pdf", headers=headers
+    )
+
+
+@app.get("/private/logo")
+def get_private_logo(
+    token: str | None = None, x_logo_token: str | None = Header(None)
+) -> Response:
+    if not PRIVATE_LOGO_PATH:
+        raise HTTPException(
+            status_code=404, detail="Logo privado nao configurado."
+        )
+
+    if PRIVATE_LOGO_REQUIRE_TOKEN:
+        if not PRIVATE_LOGO_TOKEN:
+            raise HTTPException(
+                status_code=404, detail="Logo privado nao configurado."
+            )
+        provided = token or x_logo_token
+        if not provided or not secrets.compare_digest(
+            provided, PRIVATE_LOGO_TOKEN
+        ):
+            raise HTTPException(status_code=403, detail="Token invalido.")
+
+    path = Path(PRIVATE_LOGO_PATH)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Logo nao encontrado.")
+
+    media_type = PRIVATE_LOGO_MEDIA_TYPE or mimetypes.guess_type(
+        path.name
+    )[0]
+    if not media_type:
+        media_type = "application/octet-stream"
+
+    headers = {
+        "Cache-Control": f"private, max-age={PRIVATE_LOGO_CACHE_SECONDS}"
+    }
+    return FileResponse(path, media_type=media_type, headers=headers)
+
+
+@app.post("/private/logo/upload")
+async def upload_private_logo(
+    file: UploadFile = File(...),
+    token: str | None = None,
+    x_logo_token: str | None = Header(None),
+) -> dict[str, str]:
+    if not PRIVATE_LOGO_PATH:
+        raise HTTPException(
+            status_code=404, detail="Logo privado nao configurado."
+        )
+
+    provided = token or x_logo_token
+    if PRIVATE_LOGO_REQUIRE_TOKEN:
+        if not PRIVATE_LOGO_TOKEN:
+            raise HTTPException(
+                status_code=404, detail="Logo privado nao configurado."
+            )
+        if not provided or not secrets.compare_digest(
+            provided, PRIVATE_LOGO_TOKEN
+        ):
+            raise HTTPException(status_code=403, detail="Token invalido.")
+
+    content_type = (file.content_type or "").lower()
+    guessed_type, _ = mimetypes.guess_type(file.filename or "")
+    allowed_types = {
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/svg+xml",
+    }
+    if content_type not in allowed_types and guessed_type not in allowed_types:
+        raise HTTPException(
+            status_code=400, detail="Formato de logo nao permitido."
+        )
+
+    data = await read_upload_file_limited_generic(
+        file, MAX_LOGO_BYTES, "Logo"
+    )
+    path = Path(PRIVATE_LOGO_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+    if provided:
+        logo_url = f"/private/logo?token={provided}"
+    else:
+        logo_url = "/private/logo"
+    return {"logo_url": logo_url}
 
 
 @app.post("/api/csv/extract")
@@ -4311,14 +5076,14 @@ async def extract_csv(
     template_error = validate_template_text(template_value)
     if template_error:
         raise HTTPException(status_code=400, detail=template_error)
-    markdown, render_error = render_markdown_safe(template_value, response)
+    output_html, render_error = render_html_safe(template_value, response)
     if render_error:
         raise HTTPException(status_code=400, detail=render_error)
-    filename = "csv_relatorio.md"
+    filename = "csv_relatorio.html"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return Response(
-        content=markdown,
-        media_type="text/markdown; charset=utf-8",
+        content=output_html,
+        media_type="text/html; charset=utf-8",
         headers=headers,
     )
 
@@ -4344,7 +5109,7 @@ async def render_csv_with_llm(
 
     title_hint = title.strip() if title else None
     description_hint = description.strip() if description else None
-    markdown, _meta = await generate_llm_markdown_from_csv(
+    table_html, _meta = await generate_llm_html_from_csv(
         text,
         delimiter_value,
         has_header,
@@ -4355,11 +5120,11 @@ async def render_csv_with_llm(
         temperature,
         include_header=False,
     )
-    filename = "csv_relatorio_llm.md"
+    filename = "csv_relatorio_llm.html"
     response_headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return Response(
-        content=markdown,
-        media_type="text/markdown; charset=utf-8",
+        content=table_html,
+        media_type="text/html; charset=utf-8",
         headers=response_headers,
     )
 
@@ -4393,9 +5158,6 @@ async def render_with_tables(
         template_error = validate_template_text(template_text or "")
         if template_error:
             raise HTTPException(status_code=400, detail=template_error)
-        template_error = validate_hoftalon_template(template_text or "")
-        if template_error:
-            raise HTTPException(status_code=400, detail=template_error)
     else:
         template_text, template_record, template_error = resolve_template_for_payload(
             session, template_request
@@ -4410,9 +5172,6 @@ async def render_with_tables(
         data_error = validate_hoftalon_data(data_obj)
         if data_error:
             raise HTTPException(status_code=400, detail=data_error)
-        tables_error = ensure_hoftalon_table_keys(payload.tables)
-        if tables_error:
-            raise HTTPException(status_code=400, detail=tables_error)
 
     if len(payload.tables) > MAX_LLM_TABLES:
         raise HTTPException(
@@ -4420,13 +5179,13 @@ async def render_with_tables(
             detail=f"Numero maximo de tabelas (max {MAX_LLM_TABLES}).",
         )
 
-    tables_md: dict[str, str] = {}
+    tables_html: dict[str, str] = {}
     tables_meta: list[dict[str, Any]] = []
     for table in payload.tables:
         key, key_error = normalize_table_key(table.key)
         if key_error:
             raise HTTPException(status_code=400, detail=key_error)
-        if key in tables_md:
+        if key in tables_html:
             raise HTTPException(
                 status_code=400, detail=f"Tabela duplicada: {key}."
             )
@@ -4450,11 +5209,11 @@ async def render_with_tables(
         title_hint = table.title.strip() if table.title else None
         description_hint = table.description.strip() if table.description else None
         if report_style == "hoftalon" and key == "atividades":
-            markdown_table, meta = build_hoftalon_activities_table(
+            table_html, meta = build_hoftalon_activities_table(
                 csv_text, delimiter_value, table.has_header
             )
         else:
-            markdown_table, meta = await generate_llm_markdown_from_csv(
+            table_html, meta = await generate_llm_html_from_csv(
                 csv_text,
                 delimiter_value,
                 table.has_header,
@@ -4465,18 +5224,27 @@ async def render_with_tables(
                 payload.temperature,
                 include_header=False,
             )
-        tables_md[key] = markdown_table
+        tables_html[key] = table_html
         tables_meta.append({"key": key, **meta})
 
     render_data = dict(data_obj)
+    if tables_html:
+        render_data["tables_html"] = tables_html
+        render_data["tables_meta"] = tables_meta
     if report_style == "hoftalon":
         render_data = build_hoftalon_render_data(render_data, tables_meta)
+        render_data, custom_error = prepare_custom_pages_data(render_data)
+        if custom_error:
+            raise HTTPException(status_code=400, detail=custom_error)
 
-    if tables_md:
-        render_data["tables_md"] = tables_md
-        render_data["tables_meta"] = tables_meta
+    if report_style != "hoftalon":
+        render_data, custom_error = prepare_custom_pages_data(render_data)
+        if custom_error:
+            raise HTTPException(status_code=400, detail=custom_error)
 
-    markdown, render_error = render_markdown_safe(template_text or "", render_data)
+    output_html, render_error = render_html_safe(
+        template_text or "", render_data
+    )
     if render_error:
         raise HTTPException(status_code=400, detail=render_error)
 
@@ -4485,17 +5253,17 @@ async def render_with_tables(
     else:
         append_tables = payload.append_tables
         if append_tables is None:
-            append_tables = "tables_md" not in (template_text or "")
-    if append_tables and tables_md:
-        markdown = markdown.rstrip() + "\n\n" + "\n\n".join(tables_md.values()) + "\n"
+            append_tables = "tables_html" not in (template_text or "")
+    if append_tables and tables_html:
+        output_html = output_html.rstrip() + "\n" + "\n".join(tables_html.values()) + "\n"
 
     if report_style == "hoftalon":
-        output_error = validate_hoftalon_output(markdown, tables_meta)
+        output_error = validate_hoftalon_output(output_html, tables_meta)
         if output_error:
             raise HTTPException(status_code=400, detail=output_error)
 
-    save_report(session, template_text or "", data_obj, markdown, template_record)
-    return {"markdown": markdown}
+    save_report(session, template_text or "", data_obj, output_html, template_record)
+    return {"html": output_html}
 
 
 def parse_form_data(data: str) -> tuple[dict[str, Any] | None, str | None]:

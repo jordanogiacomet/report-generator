@@ -8,10 +8,16 @@ except ModuleNotFoundError:
     from . import models
     from .config import settings
 
-engine = create_engine(
-    settings.DATABASE_URL,
-    echo=True
-)
+engine_kwargs = {
+    "echo": True,
+}
+if settings.DATABASE_URL.startswith("sqlite"):
+    engine_kwargs["connect_args"] = {
+        "timeout": 1,
+        "check_same_thread": False,
+    }
+
+engine = create_engine(settings.DATABASE_URL, **engine_kwargs)
 
 def init_db() -> None:
     SQLModel.metadata.create_all(engine)
