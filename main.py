@@ -383,10 +383,10 @@ Regularizar placas pendentes,Equipe Patrimonio,15,Alta,Executar auditoria local
 Atualizar base patrimonial,Backoffice,10,Media,Conferencia com registros legados
 Validar ativos sem numero de serie,Gestao,20,Alta,Planejar nova coleta
 """
-MAX_TEMPLATE_CHARS = 50000
+MAX_TEMPLATE_CHARS = 1000000
 MAX_TEMPLATE_KEY_CHARS = 80
 MAX_DATA_CHARS = 200000
-MAX_OUTPUT_CHARS = 50000
+MAX_OUTPUT_CHARS = 1000000
 MAX_RENDER_SECONDS = 2.0
 MAX_CSV_BYTES = 2_000_000
 MAX_CSV_ROWS = 1000
